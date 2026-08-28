@@ -53,6 +53,28 @@ const parseEntries = (raw) => {
   return { entries, bad };
 };
 
+// The `n feed` items page, captured verbatim:
+//   ### eiota's items
+//   **Ramen (L)**: 22 / **Ramen (M)**: 35 / **Ramen (S)**: 46
+//   **Birthday Cake Slice**: 1
+const STOCK_LABELS = { rl: 'Ramen \\(L\\)', rm: 'Ramen \\(M\\)', rs: 'Ramen \\(S\\)', bcs: 'Birthday Cake Slice' };
+
+const parseStock = (text) => {
+  if (!/'s items\b/i.test(text)) return null;
+  const out = {};
+  let any = false;
+  for (const [key, label] of Object.entries(STOCK_LABELS)) {
+    const m = text.match(new RegExp(`\\*\\*${label}\\*\\*:\\s*([\\d,]+)`, 'i'));
+    if (m) { out[key] = parseInt(m[1].replace(/,/g, ''), 10); any = true; }
+  }
+  return any ? out : null;
+};
+
+// Latest known stock per user, in memory — cheap and only a display nicety.
+const stockCache = new Map();
+const recordStock = (userId, stock) => stockCache.set(userId, { stock, at: Date.now() });
+const getStock = (userId) => stockCache.get(userId) ?? null;
+
 const getRoutine = (userId) => FeedRoutine.findOne({ userId }).lean();
 
 const saveRoutine = (userId, entries) =>
@@ -179,6 +201,29 @@ const show = async (userId) => {
   const xp = routineXp(entries);
   if (xp) lines.push(`-# routine grants **+${fmt(xp)} xp** across ${doable} feedable ninja(s)`);
 
+  // How many more days the routine can run on current stock.
+  const held = getStock(userId);
+  if (held) {
+    const need = {};
+    const counted = new Set();
+    for (const e of entries) {
+      if (counted.has(e.unitId)) continue;
+      counted.add(e.unitId);
+      const k = normItem(e.item);
+      need[k] = (need[k] ?? 0) + 1;
+    }
+    const runway = Object.entries(need)
+      .filter(([k]) => held.stock[k] != null)
+      .map(([k, per]) => Math.floor(held.stock[k] / per));
+    const days = runway.length ? Math.min(...runway) : null;
+
+    lines.push(
+      `-# stock: ${Object.entries(held.stock).map(([k, v]) => `\`${k}\` ${fmt(v)}`).join(' · ')}` +
+      (days != null ? ` → **${days} day(s)** of this routine` : '') +
+      ` (as of <t:${Math.floor(held.at / 1000)}:R>)`
+    );
+  }
+
   if (pending.length) {
     lines.push('', 'Still due — send these one at a time:');
     lines.push('```\n' + pending.map(line).join('\n') + '\n```');
@@ -288,4 +333,22 @@ const command = async (userId, rest) => {
   return usage(userId);
 };
 
-module.exports = { command, show, logFeed, ITEMS, normItem, itemInfo, parseEntries };
+/**
+ * Undo a feed log — used when the game refuses the command for a reason that
+ * means the ninja did *not* eat. "Already eaten a daily food" is deliberately
+ * not one of those: the ninja is fed either way, so the routine line stands.
+ */
+const unlogFeed = async (key) => {
+  try {
+    const res = await FeedLog.deleteOne({ key });
+    return res.deletedCount > 0;
+  } catch (err) {
+    console.error(`[feed] unlog failed: ${err.message}`);
+    return false;
+  }
+};
+
+module.exports = {
+  command, show, logFeed, unlogFeed, ITEMS, normItem, itemInfo, parseEntries,
+  parseStock, recordStock, getStock,
+};

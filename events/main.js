@@ -5,6 +5,9 @@ const dailies   = require("../dailies");
 const econ      = require("../econ");
 const feed      = require("../feed");
 const reports   = require("../reports");
+const quiet     = require("../quiet");
+const digest    = require("../digest");
+const monthly   = require("../pass");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -127,6 +130,9 @@ const xpSessions = new Map();
 // the two halves together.
 const reportRiddles = new Map();
 
+// channelId → the most recent `n feed`, so the game's reply can be paired with it
+const recentFeeds = new Map();
+
 // userId → unixSeconds when pause expires
 const pausedUntil = new Map();
 
@@ -175,6 +181,8 @@ setInterval(() => {
     if (now - v > NOTICE_THROTTLE_MS) failureNotices.delete(k);
   for (const [k, v] of reportRiddles)
     if (now - v.at > PENDING_TTL_MS) reportRiddles.delete(k);
+  for (const [k, v] of recentFeeds)
+    if (now - v.at > PENDING_TTL_MS) recentFeeds.delete(k);
   for (const [channelId, list] of pendingCommands) {
     const kept = list.filter(p => now - p.timestamp <= CONFIRM_WINDOW_MS);
     if (kept.length) pendingCommands.set(channelId, kept);
@@ -389,6 +397,9 @@ const armTimer = (userId, command, expiryUnix, channel) => {
     if (isReminderPaused(userId)) return;
     if (isMuted(userId, command)) return;
     bumpStat(userId, command);
+    // Inside quiet hours the ping is held, not dropped — it arrives in one
+    // summary when the window ends.
+    if (quiet.deferReminder(userId, command, channel)) return;
     safeSend(channel, `<@${userId}> your **${command}** is ready!`);
   };
 
@@ -633,6 +644,119 @@ const resolvePendingCommands = async (message, client) => {
   return false;
 };
 
+// Feeds are logged optimistically when you type them. The game's reply decides
+// whether that log stands.
+//
+//   "This ninja has already eaten a daily food"  → the ninja IS fed, so the
+//        routine line is genuinely satisfied; keep it, just say so.
+//   any other refusal                            → it did not eat; undo the log.
+const FEED_ALREADY_EATEN = /already eaten a daily food/i;
+
+const processFeedReply = async (message, text, ownerId) => {
+  const pending = recentFeeds.get(message.channel.id);
+  if (!pending) return;
+  if (Date.now() - pending.at > CONFIRM_WINDOW_MS) { recentFeeds.delete(message.channel.id); return; }
+  if (ownerId && ownerId !== pending.userId) return;
+
+  if (FEED_ALREADY_EATEN.test(text)) {
+    recentFeeds.delete(message.channel.id);
+    trace('feed already eaten', { unit: pending.unitId });
+    await safeSend(message.channel,
+      `<@${pending.userId}> **${pending.unitId}** had already eaten today — ` +
+      `counting it as done, but that \`${pending.item}\` wasn't spent.`);
+    return;
+  }
+
+  if (REJECTION_PATTERNS.some(re => re.test(text))) {
+    recentFeeds.delete(message.channel.id);
+    const undone = await feed.unlogFeed(pending.key);
+    trace('feed refused', { unit: pending.unitId, undone });
+    if (undone) {
+      await safeSend(message.channel,
+        `<@${pending.userId}> feeding **${pending.unitId}** didn't go through — ` +
+        `left it unticked in \`nh feed\`.`);
+    }
+    return;
+  }
+
+  // Anything else that names the owner is treated as success; the log stands.
+  if (ownerId === pending.userId) recentFeeds.delete(message.channel.id);
+};
+
+const persistQuiet = async (userId, cfg) => {
+  database.collection.findOneAndUpdate(
+    { userId },
+    cfg ? { $set: { quiet: cfg } } : { $unset: { quiet: '' } },
+    { upsert: true }
+  ).catch(err => console.error(`[db] quiet write failed for ${userId}: ${err.message}`));
+};
+
+/**
+ * `nh next` — everything competing for attention in one place: what is off
+ * cooldown now, what lands soonest, feeds still due, and dailies still open.
+ */
+const buildNextReport = async (userId, username) => {
+  const now   = Math.floor(Date.now() / 1000);
+  const cache = cooldownCache.get(userId) ?? {};
+
+  const ready   = [];
+  const waiting = [];
+  for (const [cmd, expiry] of Object.entries(cache)) {
+    if (isMuted(userId, cmd)) continue;
+    (expiry <= now ? ready : waiting).push([cmd, expiry]);
+  }
+  waiting.sort(([, a], [, b]) => a - b);
+
+  // Any tracked command we've never seen is also fair game right now.
+  for (const cmd of Object.keys(COOLDOWN_DURATIONS)) {
+    if (cmd.startsWith('buy_')) continue;
+    if (!(cmd in cache) && !isMuted(userId, cmd)) ready.push([cmd, now]);
+  }
+
+  const lines = [`<@${userId}> **what's next**`];
+
+  lines.push(ready.length
+    ? `\n✅ **Ready now:** ${ready.map(([c]) => `\`${c}\``).join(' · ')}`
+    : '\n😴 Nothing off cooldown yet.');
+
+  if (waiting.length) {
+    const soon = waiting.slice(0, 4)
+      .map(([c, e]) => `> \`${c}\` — ${formatDuration(e - now)}`).join('\n');
+    lines.push(`\n⏳ **Coming up:**\n${soon}`);
+  }
+
+  // Feeds still due today
+  try {
+    const feedText = await feed.show(userId);
+    const m = feedText.match(/—\s*(\d+)\/(\d+) done today/);
+    const next = feedText.match(/▶️ next: `([^`]+)`/);
+    if (m && m[1] !== m[2]) {
+      lines.push(`\n🍜 **Feeds:** ${m[1]}/${m[2]} done` + (next ? ` — next \`${next[1]}\`` : ''));
+    } else if (m) {
+      lines.push(`\n🍜 **Feeds:** all ${m[2]} done ✅`);
+    }
+  } catch { /* feed data is optional here */ }
+
+  // Dailies still open
+  try {
+    const snap = await dailies.latest(userId);
+    if (snap) {
+      const open = dailies.remaining(snap);
+      const reset = snap.resetAt
+        ? ` · resets <t:${Math.floor(new Date(snap.resetAt).getTime() / 1000)}:R>` : '';
+      lines.push(open.length
+        ? `\n📜 **Dailies:** ${open.length} open${reset}\n` +
+          open.slice(0, 3).map(t => `> ${t.total - t.done} more · ${t.label}`).join('\n')
+        : `\n📜 **Dailies:** all complete ✅${reset}`);
+    }
+  } catch { /* dailies data is optional here */ }
+
+  if (isReminderPaused(userId)) lines.push(`\n-# ⏸ reminders paused`);
+  else if (quiet.isQuiet(userId)) lines.push(`\n-# 🌙 quiet hours — pings are being held`);
+
+  return lines.join('\n');
+};
+
 // ─── Startup: restore cooldowns from DB ──────────────────────────────────────
 
 const restoreCooldownsFromDB = async (client) => {
@@ -681,6 +805,23 @@ const restoreCooldownsFromDB = async (client) => {
     }
 
     console.log(`[startup] Restored ${restored} cooldown(s) for ${users.length} user(s).`);
+    console.log(`[startup] Loaded ${quiet.loadAll(users)} quiet-hour window(s).`);
+
+    // Daily digest at each reset, delivered to the channel the user plays in.
+    digest.scheduleDaily(
+      async () => users
+        .map(u => ({
+          userId: u.userId,
+          channelId: Object.values(u.cooldowns ?? {})
+            .map(c => c?.channelId).find(Boolean) ?? null,
+        }))
+        .filter(u => u.channelId),
+      async (channelId) => {
+        try { return await client.channels.fetch(channelId); }
+        catch { return null; }
+      },
+      (userId) => isMuted(userId, 'digest')
+    );
 
     await dailies.restoreNudges(
       async (channelId) => {
@@ -755,6 +896,17 @@ const handleBotMessage = async (message, client) => {
   } else if (reports.P.stageResult.test(text)) {
     reportRiddles.delete(message.id);
   }
+
+  await processFeedReply(message, text, ownerId);
+
+  // Item stock, from the bare `n feed` page
+  if (ownerId) {
+    const stock = feed.parseStock(text);
+    if (stock) {
+      feed.recordStock(ownerId, stock);
+      trace('feed stock', { user: owner, ...stock });
+    }
+  }
   if (ownerId) {
     const noted = await xptracker.observe(message, text, ownerId);
     if (noted) trace('xp', { user: owner, noted });
@@ -769,6 +921,13 @@ const handleBotMessage = async (message, client) => {
         () => isReminderPaused(ownerId) || isMuted(ownerId, 'dailies')
       );
       trace('dailies', { user: owner, open: dailies.remaining(daily).length });
+    }
+
+    // Monthly Pass level + progress
+    const pass = monthly.parse(text);
+    if (pass) {
+      await monthly.record(ownerId, pass);
+      trace('pass', { user: owner, ...pass });
     }
 
     // Balance snapshot, for "what can I afford"
@@ -897,10 +1056,69 @@ const handleUserMessage = async (message, client) => {
     return;
   }
 
+  // ── nh quiet [HH:MM-HH:MM | off] — hold pings overnight ──────────────────
+  const quietMatch = lower.match(/^nh\s+quiet(?:\s+(.+))?$/);
+  if (quietMatch) {
+    const arg = quietMatch[1]?.trim();
+
+    if (!arg) {
+      const window = quiet.describe(userId);
+      await safeSend(message.channel, window
+        ? `<@${userId}> 🌙 quiet hours **${window}**` +
+          (quiet.pendingCount(userId) ? ` · ${quiet.pendingCount(userId)} reminder(s) held` : '') +
+          `\n-# \`nh quiet off\` to clear`
+        : `<@${userId}> no quiet hours set. Try \`nh quiet 23:00-08:00\` ` +
+          `— times are IST unless you add an offset like \`+00:00\`.`);
+      return;
+    }
+
+    if (arg === 'off' || arg === 'clear' || arg === 'none') {
+      quiet.setConfig(userId, null);
+      await persistQuiet(userId, null);
+      await safeSend(message.channel, `<@${userId}> quiet hours cleared.`);
+      return;
+    }
+
+    const cfg = quiet.parseWindow(arg);
+    if (!cfg) {
+      await safeSend(message.channel,
+        `<@${userId}> couldn't read that. Use \`nh quiet 23:00-08:00\` ` +
+        `(add \`+00:00\` for a different timezone).`);
+      return;
+    }
+    quiet.setConfig(userId, cfg);
+    await persistQuiet(userId, cfg);
+    await safeSend(message.channel,
+      `<@${userId}> 🌙 quiet hours set to **${quiet.describe(userId)}**. ` +
+      `Reminders in that window are held and delivered together when it ends.`);
+    return;
+  }
+
+  // ── nh next — one dashboard: what to do right now ────────────────────────
+  if (/^nh\s+next$/.test(lower)) {
+    await safeSend(message.channel, await buildNextReport(userId, message.author.username));
+    return;
+  }
+
   // ── nh dailies — progress toward today's set ─────────────────────────────
   if (/^nh\s+(dailies|daily|d)$/.test(lower)) {
     await safeSend(message.channel, await dailies.report(userId).catch(() =>
       `<@${userId}> couldn't read dailies data right now.`));
+    return;
+  }
+
+  // ── nh pass — Monthly Pass level and the pace to finish it ───────────────
+  if (/^nh\s+(pass|monthly)$/.test(lower)) {
+    await safeSend(message.channel, await monthly.report(userId).catch(() =>
+      `<@${userId}> couldn't read Monthly Pass data right now.`));
+    return;
+  }
+
+  // ── nh digest — preview yesterday's summary on demand ────────────────────
+  if (/^nh\s+digest$/.test(lower)) {
+    const text = await digest.build(userId).catch(() => null);
+    await safeSend(message.channel, text ??
+      `<@${userId}> nothing recorded for yesterday yet.`);
     return;
   }
 
@@ -915,7 +1133,7 @@ const handleUserMessage = async (message, client) => {
   const muteMatch = lower.match(/^nh\s+(on|off)\s+(\w+)$/);
   if (muteMatch) {
     const [, verb, target] = muteMatch;
-    const known = new Set([...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'all']);
+    const known = new Set([...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'all']);
     if (!known.has(target)) {
       await safeSend(message.channel,
         `<@${userId}> unknown reminder **${target}**. Options: ${[...known].join(', ')}`);
@@ -1010,7 +1228,12 @@ const handleUserMessage = async (message, client) => {
   // ── n feed <id> <item> — tick the routine off as you go ──────────────────
   const fedMatch = lower.match(/^n\s+feed\s+(\d+)\s+(\S+)/);
   if (fedMatch) {
+    // Logged optimistically so the checklist stays responsive, but remembered
+    // so a hard refusal can undo it — see processFeedReply.
     await feed.logFeed(userId, fedMatch[1], fedMatch[2], message.id);
+    recentFeeds.set(message.channel.id, {
+      userId, unitId: fedMatch[1], item: fedMatch[2], key: message.id, at: Date.now(),
+    });
     trace('feed logged', { user: message.author.username, unit: fedMatch[1], item: fedMatch[2] });
     return;
   }
@@ -1122,14 +1345,24 @@ const processVoteShopPurchase = async (message, client) => {
   const duration = COOLDOWN_DURATIONS[key];
   if (!duration) return;
 
-  // This duration is a hardcoded guess — the purchase message states no time.
-  // Marked as such so `n cd` or a later "still on cooldown" reply can correct it.
-  const updated = await saveCooldown(user.id, key, duration, message.channel, client,
-    { authority: AUTHORITY.table });
+  // The purchase message states when the offer is buyable again. Use it when
+  // present; the table value is only a fallback and is marked as a guess so a
+  // later `n cd` can correct it.
+  const stamp = message.content.match(/<t:(\d+)/);
+  const stated = stamp ? parseInt(stamp[1], 10) - Math.floor(Date.now() / 1000) : null;
+  const useStated = stated !== null && stated > 0;
+
+  const updated = await saveCooldown(
+    user.id, key, useStated ? stated : duration, message.channel, client,
+    { authority: useStated ? AUTHORITY.stated : AUTHORITY.table }
+  );
+
   if (updated) {
     await safeSend(message.channel,
-      `YaY ~${duration / 3600}h reminder set for **${itemMatch[1]}** vote shop cooldown.\n` +
-      `-# estimated — run \`n cd\` any time to correct it`
+      useStated
+        ? `Reminder set for **${itemMatch[1]}** — <t:${stamp[1]}:R>.`
+        : `YaY ~${duration / 3600}h reminder set for **${itemMatch[1]}** vote shop cooldown.\n` +
+          `-# estimated — run \`n cd\` any time to correct it`
     );
   }
 };

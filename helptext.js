@@ -25,11 +25,23 @@ const OVERVIEW = {
     'arm a reminder.\n\nUse **`nh help <topic>`** for detail on any group below.',
   fields: [
     {
+      name: '🧭 Right now — `nh next`',
+      value: 'One view: what is off cooldown, what lands soonest, feeds still due,\n' +
+             'and dailies still open.',
+    },
+    {
       name: '⏰ Reminders — `nh help reminders`',
       value:
         '`nh status` — every active cooldown, soonest first\n' +
         '`nh pause <Xh|Xm>` · `nh resume` — silence everything for a while\n' +
-        '`nh off <cmd>` · `nh on <cmd>` · `nh mutes` — silence one reminder',
+        '`nh off <cmd>` · `nh on <cmd>` · `nh mutes` — silence one reminder\n' +
+        '`nh quiet 23:00-08:00` — hold overnight pings, deliver them together',
+    },
+    {
+      name: '💎 Pass & digest',
+      value:
+        '`nh pass` — Monthly Pass level and the pace needed to finish it\n' +
+        '`nh digest` — yesterday\'s XP, ryo, dailies and feeds (also posts at reset)',
     },
     {
       name: '🍜 Feed routine — `nh help feed`',
@@ -111,6 +123,15 @@ const TOPICS = {
           '`nh mutes` (or `nh toggles`) — list what is currently silenced',
       },
       {
+        name: 'Quiet hours',
+        value:
+          'Dailies reset at 05:30 IST, so that reminder lands overnight. A quiet window ' +
+          '**holds** pings rather than dropping them and delivers one summary when it ends.\n' +
+          '`nh quiet 23:00-08:00` — set (times are IST by default)\n' +
+          '`nh quiet 23:00-08:00 +00:00` — set with a different timezone\n' +
+          '`nh quiet` — show the window · `nh quiet off` — clear it',
+      },
+      {
         name: 'Good to know',
         value:
           '• `mission` and `report` are memory-only — a restart forgets them, run `n cd` to restore\n' +
@@ -165,6 +186,30 @@ const TOPICS = {
           '• Matching is by ninja id, so feeding `rm` where the routine said `rl` still counts (and says so)\n' +
           '• Progress resets at 00:00 UTC with the dailies\n' +
           '• `nh feed help …` works the same as `nh feed …`',
+      },
+    ],
+  },
+
+  pass: {
+    title: '💎 Monthly Pass & digest',
+    description:
+      'Everything in `n daily` feeds the Monthly Pass — 60 levels a month. The question ' +
+      'worth answering is whether you are on pace before the month rolls over.',
+    fields: [
+      {
+        name: 'Commands',
+        value:
+          '`nh pass` (or `nh monthly`) — level, progress, days left, and the levels/day needed\n' +
+          '`nh digest` — yesterday\'s XP, ryo, dailies and feeds\n' +
+          'The digest also posts on its own just after each 00:00 UTC reset.',
+      },
+      {
+        name: 'Notes',
+        value:
+          '• Run `n pass` once so there is something to read\n' +
+          '• `nh off digest` stops the automatic post\n' +
+          '• The pass page has not been captured yet, so `nh pass` will say plainly ' +
+          'which fields it could not read rather than inventing them.',
       },
     ],
   },
