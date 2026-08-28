@@ -75,18 +75,25 @@ const solve = (info, options) => {
 
 const describe = (o) => `${o.count} ${o.colour}, ${o.place}`;
 
-/** Discord-ready line, or null when there is nothing trustworthy to say. */
-const format = (userId, info, options) => {
+/**
+ * Discord-ready line, or null when there is nothing trustworthy to say.
+ *
+ * `label` is plain text, never a mention: you are already watching the screen
+ * during the 13-second answer window, so a ping would be pure noise. The name
+ * still says whose report it is when several people are playing in one channel.
+ */
+const format = (label, info, options) => {
   const result = solve(info, options);
   if (!result) return null;
+  const who = label ? `**${label}** ` : '';
 
   if (result.exact) {
-    return `<@${userId}> 📝 report → **:${result.best.emoji}:**  -# ${describe(result.best)}`;
+    return `📝 ${who}report → **:${result.best.emoji}:**  -# ${describe(result.best)}`;
   }
   if (result.ambiguous) {
-    return `<@${userId}> 📝 report → couldn't tell these apart — looking for **${describe(info)}**`;
+    return `📝 ${who}report → couldn't tell these apart — looking for **${describe(info)}**`;
   }
-  return `<@${userId}> 📝 report → probably **:${result.best.emoji}:** ` +
+  return `📝 ${who}report → probably **:${result.best.emoji}:** ` +
          `(${result.best.score}/3 match) -# looking for ${describe(info)}`;
 };
 

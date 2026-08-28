@@ -885,7 +885,8 @@ const handleBotMessage = async (message, client) => {
     if (riddle && !riddle.answered) {
       riddle.answered = true;
       const options = reports.parseOptions(text);
-      const line = ownerId ? reports.format(ownerId, riddle.info, options) : null;
+      // Plain name, not a mention — this fires while you're watching the timer.
+      const line = ownerId ? reports.format(owner, riddle.info, options) : null;
       if (line) {
         await safeSend(message.channel, line);
         trace('report answered', { user: owner, options: options.length });
