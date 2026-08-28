@@ -1013,6 +1013,10 @@ const handleBotMessage = async (message, client) => {
     }
   }
 
+  // A refusal states the real remaining cooldown — the strongest correction
+  // available, and proof the last reminder was early.
+  await processCooldownRefusal(message, text, client);
+
   await processFeedReply(message, text, ownerId);
 
   // Item stock, from the bare `n feed` page
@@ -1435,6 +1439,62 @@ const processCooldownEmbed = async (message, client) => {
   if (anyUpdated && !isSilent) {
     await safeSend(message.channel, `<@${user.id}> reminders added for your cooldowns.`);
   }
+};
+
+// When the game refuses a command it states exactly how long is left, e.g.
+//   "Wait 39s for your next mission **eiota**."
+//   "Wait 2h 7m 3s for your next tower challenge **eiota**."
+//   "You next report will be ready in 10 minutes **eiota**!"
+// That is a better cooldown than anything we hold, and it is the direct evidence
+// that our reminder fired early. Folding it back in stops the drift at source.
+const REFUSAL = {
+  wait:  /wait\s+`?([\dhms.\s]+?)`?\s+(?:before|for)\s+your next\s+([a-z ]+?)\s*\*\*/i,
+  ready: /you'?r?e?\s*next\s+([a-z]+)\s+will be ready\s+([^*]+?)\s*\*\*/i,
+  who:   /\*\*([^*\n]+?)\*\*/,
+};
+
+// What the game calls an activity → our command name.
+const REFUSAL_COMMANDS = {
+  mission: 'mission', report: 'report', challenge: 'challenge',
+  training: 'train', 'tower challenge': 'tower', tower: 'tower',
+  'weekly reward': 'weekly', 'daily reward': 'daily',
+};
+
+const processCooldownRefusal = async (message, text, client) => {
+  let command = null, durationText = null;
+
+  const wait = text.match(REFUSAL.wait);
+  if (wait) {
+    durationText = wait[1].trim();
+    command = REFUSAL_COMMANDS[wait[2].trim().toLowerCase()] ?? null;
+  } else {
+    const ready = text.match(REFUSAL.ready);
+    if (ready) {
+      command = REFUSAL_COMMANDS[ready[1].trim().toLowerCase()] ?? null;
+      durationText = ready[2].replace(/^in\s+/i, '').trim();
+    }
+  }
+  if (!command) return false;
+
+  // "27m 12s" and "10 minutes" both need to parse.
+  let seconds = parseTimeString(durationText);
+  if (!seconds) {
+    let total = 0;
+    for (const m of durationText.matchAll(/(\d+)\s*(day|hour|minute|second)s?\b/gi)) {
+      total += parseInt(m[1], 10) * ({ d: 86400, h: 3600, m: 60, s: 1 })[m[2][0].toLowerCase()];
+    }
+    seconds = total;
+  }
+  if (!seconds || seconds <= 0) return false;
+
+  const name = text.match(REFUSAL.who)?.[1]?.trim();
+  const user = name ? findUserByUsername(client, name) : null;
+  if (!user) { trace('refusal — unknown user', { name, command, seconds }); return false; }
+
+  const corrected = await saveCooldown(user.id, command, seconds, message.channel, client,
+    { authority: AUTHORITY.stated });
+  trace('cooldown from refusal', { user: name, command, seconds, corrected });
+  return corrected;
 };
 
 const parseCooldownLine = (line) => {
