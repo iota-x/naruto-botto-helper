@@ -19,9 +19,10 @@ XpSampleSchema.index({ userId: 1, name: 1, at: -1 });
 // inferred from polling.
 const XpEventSchema = new mongoose.Schema({
   userId: { type: String, required: true },
-  source: { type: String, required: true },  // train | report | mission
+  source: { type: String, required: true },  // train | report | mission | daily_tier
   amount: { type: Number, default: 0 },      // xp gained per ninja
   ryo:    { type: Number, default: 0 },      // ryo earned (+) or spent (−)
+  rank:   { type: String, default: null },   // missions only: C | B | A | S | …
   key:    { type: String, default: null },   // dedupe key: message id
   at:     { type: Date, default: Date.now, expires: '60d' },
 });

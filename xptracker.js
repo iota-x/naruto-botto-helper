@@ -31,6 +31,7 @@ const P = {
   ninjaLine:   /\*\*([^*\n]+?)\*\*\s*\n\*\*Lvl\*\*:\s*(\d+)(?:\s*->\s*(\d+))?\s*·\s*\*\*Exp\*\*:\s*([\d,]+)(?:\s*->\s*([\d,]+))?/g,
   reportGain:  /ninjas in team gained\s*([\d,]+)\s*xp/i,
   ryoEarned:   /you earned\s*([\d,]+)\s*ry/i,
+  missionRank: /'s\s+([A-Z])\s+rank mission/i,
   teamXp:      /([\d,]+)\/([\d,]+)\s*XP/i,
   teamId:      /\(id:(\d+)\)/i,
   teamLevel:   /\(Lv\.(\d+)\)/i,
@@ -48,12 +49,12 @@ const lastDailyReset = () => {
 
 // ─── Ingest ──────────────────────────────────────────────────────────────────
 
-const saveEvent = async (userId, source, amount, ryo, key) => {
+const saveEvent = async (userId, source, amount, ryo, key, extra = {}) => {
   if (!amount && !ryo) return false;
   try {
     await XpEvent.updateOne(
       { key },                                   // message id — an edit re-fires
-      { $setOnInsert: { userId, source, amount, ryo, key, at: new Date() } },
+      { $setOnInsert: { userId, source, amount, ryo, key, at: new Date(), ...extra } },
       { upsert: true }
     );
     return true;
@@ -110,11 +111,14 @@ const observe = async (message, text, userId) => {
     }
 
     // ── Mission result (ryo only) ──────────────────────────────────────────
+    // The rank sits in the header ("### eiota's B rank mission") and survives
+    // into the edited result, so both come off the same text.
     if (/rank mission/i.test(text)) {
       const ryo = text.match(P.ryoEarned);
       if (ryo) {
-        await saveEvent(userId, 'mission', 0, num(ryo[1]), `${id}:mission`);
-        return `mission +${num(ryo[1])} ryo`;
+        const rank = text.match(P.missionRank)?.[1]?.toUpperCase() ?? null;
+        await saveEvent(userId, 'mission', 0, num(ryo[1]), `${id}:mission`, { rank });
+        return `mission${rank ? ` (${rank})` : ''} +${num(ryo[1])} ryo`;
       }
       return null;
     }
@@ -260,8 +264,53 @@ const report = async (userId, unitFilter = null) => {
   return lines.join('\n');
 };
 
+/** Mission counts and payout by rank, over the last `days`. */
+const missionReport = async (userId, days = 7) => {
+  const since = new Date(Date.now() - days * 86_400_000);
+  const rows = await XpEvent.find({ userId, source: 'mission', at: { $gte: since } }).lean();
+  if (!rows.length) {
+    return `<@${userId}> no missions recorded in the last ${days} day(s).`;
+  }
+
+  const byRank = {};
+  for (const r of rows) {
+    const k = r.rank ?? '?';
+    const b = byRank[k] ?? (byRank[k] = { n: 0, ryo: 0 });
+    b.n++; b.ryo += r.ryo || 0;
+  }
+
+  const ORDER = ['S', 'A', 'B', 'C', 'D', '?'];
+  const total = rows.reduce((s, r) => s + (r.ryo || 0), 0);
+  const today = rows.filter(r => new Date(r.at) >= lastDailyReset());
+
+  const lines = [
+    `<@${userId}> ⚔️ **missions** — last ${days} day(s)`,
+    `${rows.length} run · **${fmt(total)} ryo** · avg **${fmt(Math.round(total / rows.length))}**/run`,
+    today.length ? `-# ${today.length} since today's reset` : '',
+    '',
+  ].filter(Boolean);
+
+  const max = Math.max(...Object.values(byRank).map(b => b.n));
+  for (const rank of ORDER) {
+    const b = byRank[rank];
+    if (!b) continue;
+    const bar = '█'.repeat(Math.max(1, Math.round((b.n / max) * 12)));
+    lines.push(
+      `\`${rank === '?' ? '·' : rank}\` \`${bar.padEnd(12)}\` **${b.n}** · ` +
+      `avg ${fmt(Math.round(b.ryo / b.n))} ryo`
+    );
+  }
+
+  const unknown = byRank['?'];
+  if (unknown) lines.push(`-# \`·\` = rank not captured (recorded before rank tracking, or a wording change)`);
+
+  return lines.join('\n');
+};
+
 /** Record a gain the page-based `observe` doesn't cover (e.g. daily tier rewards). */
 const recordExternal = (userId, source, amount, ryo, key) =>
   saveEvent(userId, source, amount, ryo, key);
 
-module.exports = { observe, report, lastDailyReset, normaliseName, recordExternal };
+module.exports = {
+  observe, report, lastDailyReset, normaliseName, recordExternal, missionReport,
+};

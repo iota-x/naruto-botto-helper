@@ -8,6 +8,7 @@ const reports   = require("../reports");
 const quiet     = require("../quiet");
 const digest    = require("../digest");
 const monthly   = require("../pass");
+const jutsu     = require("../jutsu");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -949,6 +950,24 @@ const handleBotMessage = async (message, client) => {
     }
   }
 
+  // Jutsu upgrade prompt — answer the affordability question while the
+  // yes/no is still open. No mention, same reasoning as the report helper.
+  const upgrade = jutsu.parse(text);
+  if (upgrade) {
+    // This page names the user at the end rather than in a header.
+    const name = upgrade.user ?? owner;
+    const id   = name ? resolveUserId(client, name) : ownerId;
+    if (id && !isMuted(id, 'jutsu')) {
+      const verdict = await jutsu.check(id, upgrade, name).catch(() => null);
+      if (verdict) {
+        await safeSend(message.channel, verdict);
+        trace('jutsu check', { user: name, unit: upgrade.unitId, to: upgrade.to });
+      }
+    } else if (!id) {
+      trace('jutsu check skipped — unknown user', { name });
+    }
+  }
+
   await processFeedReply(message, text, ownerId);
 
   // Item stock, from the bare `n feed` page
@@ -1159,6 +1178,22 @@ const handleUserMessage = async (message, client) => {
     return;
   }
 
+  // ── nh missions [days] — counts and payout by rank ───────────────────────
+  const missionsMatch = lower.match(/^nh\s+(?:missions|ranks)(?:\s+(\d+))?$/);
+  if (missionsMatch) {
+    const days = Math.min(30, Math.max(1, parseInt(missionsMatch[1] ?? '7', 10)));
+    await safeSend(message.channel, await xptracker.missionReport(userId, days).catch(() =>
+      `<@${userId}> couldn't read mission data right now.`));
+    return;
+  }
+
+  // ── nh streak — consecutive fully-cleared days ───────────────────────────
+  if (/^nh\s+streaks?$/.test(lower)) {
+    await safeSend(message.channel, await digest.streakReport(userId).catch(() =>
+      `<@${userId}> couldn't read streak data right now.`));
+    return;
+  }
+
   // ── nh pass — Monthly Pass level and the pace to finish it ───────────────
   if (/^nh\s+(pass|monthly)$/.test(lower)) {
     await safeSend(message.channel, await monthly.report(userId).catch(() =>
@@ -1191,7 +1226,7 @@ const handleUserMessage = async (message, client) => {
     const target = MUTE_ALIASES[raw] ?? raw;
 
     const known = new Set([
-      ...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'answers', 'all',
+      ...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'answers', 'jutsu', 'all',
     ]);
     if (!known.has(target)) {
       await safeSend(message.channel,

@@ -48,7 +48,23 @@ const FeedLogSchema = new mongoose.Schema({
 FeedLogSchema.index({ userId: 1, at: -1 });
 FeedLogSchema.index({ key: 1 }, { unique: true, sparse: true });
 
+// One row per user per day, written at the reset. Kept separate from the
+// snapshots (which expire in 14 days) so streak history survives long term.
+const DailyResultSchema = new mongoose.Schema({
+  userId:     { type: String, required: true },
+  day:        { type: String, required: true },   // YYYY-MM-DD of the day that ended, UTC
+  completed:  { type: Boolean, default: false },
+  tasksDone:  { type: Number, default: 0 },
+  tasksTotal: { type: Number, default: 0 },
+  xp:         { type: Number, default: 0 },
+  ryo:        { type: Number, default: 0 },
+  feeds:      { type: Number, default: 0 },
+  at:         { type: Date, default: Date.now },
+});
+DailyResultSchema.index({ userId: 1, day: -1 }, { unique: true });
+
 module.exports = {
+  DailyResult: mongoose.model('dailyresult', DailyResultSchema, 'dailyresults'),
   Dailies:     mongoose.model('dailies', DailiesSchema, 'dailies'),
   Balance:     mongoose.model('balance', BalanceSchema, 'balances'),
   FeedRoutine: mongoose.model('feedroutine', FeedRoutineSchema, 'feedroutines'),

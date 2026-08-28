@@ -38,10 +38,18 @@ const OVERVIEW = {
         '`nh quiet 23:00-08:00` — hold overnight pings, deliver them together',
     },
     {
-      name: '💎 Pass & digest',
+      name: '💎 Pass, stats & streaks',
       value:
         '`nh pass` — Monthly Pass level and the pace needed to finish it\n' +
+        '`nh missions [days]` — mission counts and ryo by rank\n' +
+        '`nh streak` — consecutive days with every daily cleared\n' +
         '`nh digest` — yesterday\'s XP, ryo, dailies and feeds (also posts at reset)',
+    },
+    {
+      name: '🌀 Jutsu upgrades',
+      value:
+        'When `n jutsu` asks to confirm, I check the cost against your last `n bal`\n' +
+        'and say whether you can afford it. `nh off jutsu` turns it off.',
     },
     {
       name: '🍜 Feed routine — `nh help feed`',
@@ -153,8 +161,9 @@ const TOPICS = {
         name: 'Setting it up',
         value:
           'Paste the whole routine in one message:\n' +
-          '```\nnh feed set\nn feed 223 rl\nn feed 265 rl\nn feed 152 rm\n```\n' +
-          '`n feed` / `feed` prefixes are optional — `223 rl` on its own works too.',
+          '```\nnh feed set\n223 rl\n265 rl\n152 rm\n```\n' +
+          'Just id and item — I build the `n feed …` command for you. ' +
+          'Pasting a full `n feed 223 rl` also works, so you can copy an existing routine straight in.',
       },
       {
         name: 'Daily use',

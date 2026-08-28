@@ -8,7 +8,7 @@
 // watching for your own `n feed` messages.
 //
 //   nh feed                      show the routine and what's left today
-//   nh feed add 223 rl           append (also accepts a full "n feed 223 rl")
+//   nh feed add 223 rl           append — just id and item; "n feed" is optional
 //   nh feed set <lines…>         replace the whole routine (multi-line friendly)
 //   nh feed remove 4             remove by position
 //   nh feed remove 223 rl        remove the first matching entry
@@ -147,7 +147,7 @@ const usage = (userId) => [
   `<@${userId}> **feed routine**`,
   '> `nh feed` — show the routine and what is still due today',
   '> `nh feed set <lines>` — replace it (paste all your lines at once)',
-  '> `nh feed add 223 rl` — append one (a full `n feed 223 rl` works too)',
+  '> `nh feed add 223 rl` — append one (the `n feed` prefix is optional)',
   '> `nh feed remove 4` / `nh feed remove 223 rl` — remove by position or content',
   '> `nh feed done` — mark everything done · `nh feed clear` — delete the routine',
   `-# items: ${Object.entries(ITEMS).map(([k, v]) => `\`${k}\` ${v.label} +${fmt(v.xp)}`).join(' · ')}`,
@@ -158,8 +158,9 @@ const show = async (userId) => {
   const entries = routine?.entries ?? [];
 
   if (!entries.length) {
-    return `<@${userId}> no feed routine saved yet. Paste yours in one go:\n` +
-      '```\nnh feed set\nn feed 223 rl\nn feed 265 rl\nn feed 152 rm\n```';
+    return `<@${userId}> no feed routine saved yet. Paste yours in one go — ` +
+      `just id and item, one per line:\n` +
+      '```\nnh feed set\n223 rl\n265 rl\n152 rm\n```';
   }
 
   const states  = progress(entries, await todaysLog(userId));
@@ -248,7 +249,7 @@ const command = async (userId, rest) => {
   if (sub === 'set') {
     const { entries, bad } = parseEntries(args);
     if (!entries.length) {
-      return `<@${userId}> couldn't read any feed lines. Try:\n\`\`\`\nnh feed set\nn feed 223 rl\nn feed 152 rm\n\`\`\``;
+      return `<@${userId}> couldn't read any feed lines. Try:\n\`\`\`\nnh feed set\n223 rl\n152 rm\n\`\`\``;
     }
     await saveRoutine(userId, entries);
     return `<@${userId}> saved **${entries.length}** feed line(s)` +
