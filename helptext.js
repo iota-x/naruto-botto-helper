@@ -26,8 +26,8 @@ const OVERVIEW = {
   fields: [
     {
       name: '🧭 Right now — `nh next`',
-      value: 'One view: what is off cooldown, what lands soonest, feeds still due,\n' +
-             'and dailies still open.',
+      value: 'One view: what is off cooldown, feeds due today with the exact commands,\n' +
+             'what lands soonest, and dailies still open.',
     },
     {
       name: '⏰ Reminders — `nh help reminders`',

@@ -772,29 +772,40 @@ const buildNextReport = async (userId, username) => {
     if (!(cmd in cache) && !isMuted(userId, cmd)) ready.push([cmd, now]);
   }
 
+  // Feeds are actionable right now and expire at reset, so they rank with the
+  // ready items rather than sitting below as a status footnote.
+  let feeds = null;
+  try { feeds = await feed.pending(userId); }
+  catch (err) { console.error(`[next] feed lookup failed: ${err.message}`); }
+
+  const feedsDue = feeds?.entries.length ?? 0;
+
   const lines = [`<@${userId}> **what's next**`];
 
-  lines.push(ready.length
-    ? `\n✅ **Ready now:** ${ready.map(([c]) => `\`${c}\``).join(' · ')}`
-    : '\n😴 Nothing off cooldown yet.');
+  if (!ready.length && !feedsDue) {
+    lines.push('\n😴 Nothing to do right now.');
+  }
+
+  if (ready.length) {
+    lines.push(`\n✅ **Ready now:** ${ready.map(([c]) => `\`${c}\``).join(' · ')}`);
+  }
+
+  if (feedsDue) {
+    const shown = feeds.entries.slice(0, 6).map(e => `> \`${feed.commandFor(e)}\``).join('\n');
+    lines.push(
+      `\n🍜 **Due today:** ${feedsDue} feed${feedsDue === 1 ? '' : 's'} left ` +
+      `(${feeds.done}/${feeds.total} done)\n${shown}` +
+      (feedsDue > 6 ? `\n> -# +${feedsDue - 6} more` : '')
+    );
+  } else if (feeds?.total) {
+    lines.push(`\n🍜 **Feeds:** all ${feeds.total} done ✅`);
+  }
 
   if (waiting.length) {
     const soon = waiting.slice(0, 4)
       .map(([c, e]) => `> \`${c}\` — ${formatDuration(e - now)}`).join('\n');
     lines.push(`\n⏳ **Coming up:**\n${soon}`);
   }
-
-  // Feeds still due today
-  try {
-    const feedText = await feed.show(userId);
-    const m = feedText.match(/—\s*(\d+)\/(\d+) done today/);
-    const next = feedText.match(/▶️ next: `([^`]+)`/);
-    if (m && m[1] !== m[2]) {
-      lines.push(`\n🍜 **Feeds:** ${m[1]}/${m[2]} done` + (next ? ` — next \`${next[1]}\`` : ''));
-    } else if (m) {
-      lines.push(`\n🍜 **Feeds:** all ${m[2]} done ✅`);
-    }
-  } catch { /* feed data is optional here */ }
 
   // Dailies still open
   try {
