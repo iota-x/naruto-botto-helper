@@ -4,6 +4,7 @@ const xptracker = require("../xptracker");
 const dailies   = require("../dailies");
 const econ      = require("../econ");
 const feed      = require("../feed");
+const reports   = require("../reports");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -121,6 +122,11 @@ const cdCheckSuppressed = new Set();
 // `${userId}:${unitId}` → { startXp, timestamp, pending, pendingEnd, endChannelId }
 const xpSessions = new Map();
 
+// messageId → { info, at, answered } for an in-flight `n r`.
+// The info page and the options are edits of the same message, so the id ties
+// the two halves together.
+const reportRiddles = new Map();
+
 // userId → unixSeconds when pause expires
 const pausedUntil = new Map();
 
@@ -167,6 +173,8 @@ setInterval(() => {
     if (now - v.timestamp > PENDING_TTL_MS) recentChallenges.delete(k);
   for (const [k, v] of failureNotices)
     if (now - v > NOTICE_THROTTLE_MS) failureNotices.delete(k);
+  for (const [k, v] of reportRiddles)
+    if (now - v.at > PENDING_TTL_MS) reportRiddles.delete(k);
   for (const [channelId, list] of pendingCommands) {
     const kept = list.filter(p => now - p.timestamp <= CONFIRM_WINDOW_MS);
     if (kept.length) pendingCommands.set(channelId, kept);
@@ -342,34 +350,89 @@ const isOnCooldown = (userId, command) => {
   return expiry ? expiry > Math.floor(Date.now() / 1000) : false;
 };
 
+// How much we trust a cooldown value. A better-sourced number is allowed to
+// correct a worse one — without this, the first (often hardcoded) guess was
+// frozen in for its whole duration because saveCooldown refused to update an
+// already-armed cooldown. That is how buy_v15 kept firing minutes early.
+const AUTHORITY = {
+  table:   0,  // hardcoded guess in COOLDOWN_DURATIONS
+  derived: 1,  // computed by us, e.g. next 00:00 UTC
+  stated:  2,  // the game bot told us: `n cd` remaining, <t:…>, "6d 23h 54m"
+};
+
+// userId → { [command]: authority }
+const cooldownAuthority = new Map();
+const getAuthority = (userId, command) => cooldownAuthority.get(userId)?.[command] ?? -1;
+const setAuthority = (userId, command, level) => {
+  const m = cooldownAuthority.get(userId) ?? {};
+  m[command] = level;
+  cooldownAuthority.set(userId, m);
+};
+
 /**
- * Returns true if a new reminder was registered.
- * Returns false if already on cooldown (no-op).
+ * Fire a reminder, guarding against firing early.
+ *
+ * A long setTimeout can come due before its wall-clock deadline — the process
+ * being suspended and resumed, the system clock moving, or the timer simply
+ * drifting. Re-checking the clock here makes an early ping structurally
+ * impossible: if there is time left, we just reschedule.
  */
-const saveCooldown = async (userId, command, cooldownSeconds, channel, client) => {
+const armTimer = (userId, command, expiryUnix, channel) => {
+  const fire = () => {
+    if (cooldownCache.get(userId)?.[command] !== expiryUnix) return; // superseded
+    const left = expiryUnix - Math.floor(Date.now() / 1000);
+    if (left > 0) {
+      console.warn(`[cooldown] ${command} for ${userId} came due ${left}s early — rescheduling`);
+      setTimeout(fire, left * 1000).unref();
+      return;
+    }
+    if (isReminderPaused(userId)) return;
+    if (isMuted(userId, command)) return;
+    bumpStat(userId, command);
+    safeSend(channel, `<@${userId}> your **${command}** is ready!`);
+  };
+
+  const delay = Math.max(0, (expiryUnix - Math.floor(Date.now() / 1000)) * 1000);
+  setTimeout(fire, delay).unref();
+};
+
+/**
+ * Returns true if a reminder was registered or corrected, false if it was a no-op.
+ * `opts.authority` says how trustworthy the duration is — see AUTHORITY above.
+ */
+const saveCooldown = async (userId, command, cooldownSeconds, channel, client, opts = {}) => {
+  const authority = opts.authority ?? AUTHORITY.table;
+
   if (RETIRED_COMMANDS.has(command)) return false;
-  if (isOnCooldown(userId, command)) return false;
   if (!Number.isFinite(cooldownSeconds) || cooldownSeconds < 0) return false;
 
-  const expiryUnix = Math.floor(Date.now() / 1000) + cooldownSeconds;
+  const now        = Math.floor(Date.now() / 1000);
+  const expiryUnix = now + cooldownSeconds;
   const channelId  = channel.id;
+  const existing   = cooldownCache.get(userId)?.[command];
+
+  if (existing && existing > now) {
+    const prev  = getAuthority(userId, command);
+    const drift = expiryUnix - existing;
+
+    if (authority < prev) return false;             // never downgrade a good value
+    if (Math.abs(drift) <= 60) return false;        // close enough, keep the armed timer
+
+    console.log(
+      `[cooldown] correcting ${command} for ${userId}: ${drift > 0 ? '+' : ''}${drift}s ` +
+      `(authority ${prev} → ${authority})`
+    );
+    trace('cooldown corrected', { command, driftSeconds: drift, from: prev, to: authority });
+  }
 
   // Update memory cache
   const userCache = cooldownCache.get(userId) ?? {};
   userCache[command] = expiryUnix;
   cooldownCache.set(userId, userCache);
+  setAuthority(userId, command, authority);
 
   // Arm the reminder timer
-  if (cooldownSeconds > 0) {
-    setTimeout(() => {
-      const check = cooldownCache.get(userId);
-      if (check?.[command] !== expiryUnix) return; // superseded by a newer cooldown
-      if (isReminderPaused(userId)) return;
-      if (isMuted(userId, command)) return;
-      bumpStat(userId, command);
-      safeSend(channel, `<@${userId}> your **${command}** is ready!`);
-    }, cooldownSeconds * 1000).unref();
-  }
+  if (cooldownSeconds > 0) armTimer(userId, command, expiryUnix, channel);
 
   // Persist to DB — fire-and-forget, never blocks the message handler
   if (!MEMORY_ONLY.has(command)) {
@@ -474,7 +537,11 @@ const resolvePendingCommands = async (message, client) => {
     const source = stated !== null && stated > 0 ? 'stated' : 'table';
     const seconds = source === 'stated' ? stated : durationFor(entry.command);
 
-    const armed = await saveCooldown(entry.userId, entry.command, seconds, message.channel, client);
+    const armed = await saveCooldown(entry.userId, entry.command, seconds, message.channel, client, {
+      authority: source === 'stated' ? AUTHORITY.stated
+               : DYNAMIC_DURATIONS[entry.command] ? AUTHORITY.derived
+               : AUTHORITY.table,
+    });
     console.log(`[confirm] ${entry.command} ${armed ? 'confirmed' : 'already tracked'} for ${entry.username} (${seconds}s, ${source})`);
     trace(`commit ${entry.command}`, {
       user: entry.username, seconds, durationSource: source,
@@ -543,7 +610,11 @@ const resolvePendingCommands = async (message, client) => {
       if (!patterns[0].test(text)) continue;
       const stated  = DURATION_FROM_TEXT[command]?.(text) ?? null;
       const seconds = stated !== null && stated > 0 ? stated : durationFor(command);
-      await saveCooldown(user.id, command, seconds, message.channel, client);
+      await saveCooldown(user.id, command, seconds, message.channel, client, {
+        authority: stated !== null && stated > 0 ? AUTHORITY.stated
+                 : DYNAMIC_DURATIONS[command] ? AUTHORITY.derived
+                 : AUTHORITY.table,
+      });
       trace(`commit ${command} (no armed intent)`, { user: user.username, seconds });
       return true;
     }
@@ -585,22 +656,19 @@ const restoreCooldownsFromDB = async (client) => {
         if (remaining <= 0) continue;
 
         userCache[command] = entry.expiry;
+        cooldownCache.set(user.userId, userCache); // armTimer reads this
+        setAuthority(user.userId, command, AUTHORITY.table); // unknown provenance
         restored++;
 
-        setTimeout(async () => {
-          const check = cooldownCache.get(user.userId);
-          if (check?.[command] !== entry.expiry) return;
-          if (isReminderPaused(user.userId)) return;
-          if (isMuted(user.userId, command)) return;
-          bumpStat(user.userId, command);
-
-          try {
+        // Resolve the channel lazily so one dead channel can't stall startup.
+        const lazyChannel = {
+          id: entry.channelId,
+          send: async (content) => {
             const channel = await client.channels.fetch(entry.channelId);
-            await safeSend(channel, `<@${user.userId}> your **${command}** is ready!`);
-          } catch (err) {
-            console.warn(`[restore] Could not remind ${user.userId} for ${command}: ${err.message}`);
-          }
-        }, remaining * 1000).unref();
+            return channel.send(content);
+          },
+        };
+        armTimer(user.userId, command, entry.expiry, lazyChannel);
       }
 
       if (Object.keys(userCache).length > 0) cooldownCache.set(user.userId, userCache);
@@ -661,6 +729,32 @@ const handleBotMessage = async (message, client) => {
   // team page all carry numbers worth keeping, whatever else we do with them.
   const owner  = extractOwner(text);
   const ownerId = owner ? resolveUserId(client, owner) : null;
+
+  // ── Report riddle: remember the info, answer when the options appear ──────
+  if (reports.P.stageInfo.test(text)) {
+    const info = reports.parseInfo(text);
+    if (info) {
+      reportRiddles.set(message.id, { info, at: Date.now(), answered: false });
+      trace('report info', { user: owner, ...info });
+    } else {
+      trace('report info unparsed', { preview: text.replace(/\s+/g, ' ').slice(0, 120) });
+    }
+  } else if (reports.P.stageWriting.test(text)) {
+    const riddle = reportRiddles.get(message.id);
+    if (riddle && !riddle.answered) {
+      riddle.answered = true;
+      const options = reports.parseOptions(text);
+      const line = ownerId ? reports.format(ownerId, riddle.info, options) : null;
+      if (line) {
+        await safeSend(message.channel, line);
+        trace('report answered', { user: owner, options: options.length });
+      } else {
+        trace('report unanswerable', { user: owner, options: options.length });
+      }
+    }
+  } else if (reports.P.stageResult.test(text)) {
+    reportRiddles.delete(message.id);
+  }
   if (ownerId) {
     const noted = await xptracker.observe(message, text, ownerId);
     if (noted) trace('xp', { user: owner, noted });
@@ -962,7 +1056,10 @@ const processCooldownEmbed = async (message, client) => {
       if (['vote', 'booster'].includes(command)) continue;
       if (RETIRED_COMMANDS.has(command)) continue;
 
-      const updated = await saveCooldown(user.id, command, cooldownTime, message.channel, client);
+      // `n cd` reports real remaining times — the most reliable source we have,
+      // and the way to resync anything that drifted.
+      const updated = await saveCooldown(user.id, command, cooldownTime, message.channel, client,
+        { authority: AUTHORITY.stated });
       if (updated) anyUpdated = true;
     }
   }
@@ -1025,10 +1122,14 @@ const processVoteShopPurchase = async (message, client) => {
   const duration = COOLDOWN_DURATIONS[key];
   if (!duration) return;
 
-  const updated = await saveCooldown(user.id, key, duration, message.channel, client);
+  // This duration is a hardcoded guess — the purchase message states no time.
+  // Marked as such so `n cd` or a later "still on cooldown" reply can correct it.
+  const updated = await saveCooldown(user.id, key, duration, message.channel, client,
+    { authority: AUTHORITY.table });
   if (updated) {
     await safeSend(message.channel,
-      `YaY ${duration / 3600}h reminder set for **${itemMatch[1]}** vote shop cooldown.`
+      `YaY ~${duration / 3600}h reminder set for **${itemMatch[1]}** vote shop cooldown.\n` +
+      `-# estimated — run \`n cd\` any time to correct it`
     );
   }
 };
@@ -1044,16 +1145,29 @@ const processVoteShopCooldown = async (message, client) => {
   const user    = findUserByUsername(client, rawName);
   if (!user) return;
 
+  const key = `buy_${itemMatch[1].toLowerCase()}`;
   const remainingSeconds = parseInt(timeMatch[1]) - Math.floor(Date.now() / 1000);
-  if (remainingSeconds <= 0) return;
 
-  const updated = await saveCooldown(
-    user.id,
-    `buy_${itemMatch[1].toLowerCase()}`,
-    remainingSeconds,
-    message.channel,
-    client
-  );
+  // The game sometimes reports a "purchasable again" time that is already in the
+  // past while still refusing the purchase. Giving up here left the user with an
+  // expired reminder and no follow-up, so re-check instead of going silent.
+  if (remainingSeconds <= 0) {
+    const RECHECK = 3600;
+    const armed = await saveCooldown(user.id, key, RECHECK, message.channel, client,
+      { authority: AUTHORITY.stated });
+    console.warn(`[voteshop] ${key} refused for ${user.id} but stated time is ` +
+                 `${-remainingSeconds}s in the past — re-checking in ${RECHECK}s`);
+    if (armed) {
+      await safeSend(message.channel,
+        `<@${user.id}> **${itemMatch[1]}** is still on cooldown even though the bot says ` +
+        `<t:${timeMatch[1]}:R>. I'll remind you again in 1h — \`n cd\` for the real timer.`
+      );
+    }
+    return;
+  }
+
+  const updated = await saveCooldown(user.id, key, remainingSeconds, message.channel, client,
+    { authority: AUTHORITY.stated });
 
   if (updated) {
     await safeSend(message.channel,

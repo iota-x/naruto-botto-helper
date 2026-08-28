@@ -39,6 +39,12 @@ const OVERVIEW = {
         '`nh feed add 223 rl` · `nh feed remove 4` · `nh feed done` · `nh feed clear`',
     },
     {
+      name: '📝 Report helper — `nh help reports`',
+      value:
+        'When `n r` asks you to pick the info back out of three options, I read the\n' +
+        'earlier info page and tell you which one matches. Automatic, no command.',
+    },
+    {
       name: '📈 XP & levelling — `nh help xp`',
       value:
         '`nh xp` — gained since reset, xp/hr, and level-up ETA per ninja\n' +
@@ -88,8 +94,10 @@ const TOPICS = {
           'When the bot states a real time, that wins over the table above:\n' +
           '• dailies — `Resets <t:…>` on the `n d` page\n' +
           '• weekly — "your next weekly reward is in 6d 23h…"\n' +
-          '• `n cd` — every remaining time at once, the most reliable source\n' +
-          'Run `n cd` after a restart to resync everything.',
+          '• `n cd` — every remaining time at once, the most reliable source\n\n' +
+          'Values the bot only *guesses* (tower, challenge, and the vote shop, where the ' +
+          'game states no time) can be **corrected** by any better source — so if a ' +
+          'reminder lands a few minutes early, run `n cd` once and it self-corrects.',
       },
       {
         name: 'Controls',
@@ -157,6 +165,30 @@ const TOPICS = {
           '• Matching is by ninja id, so feeding `rm` where the routine said `rl` still counts (and says so)\n' +
           '• Progress resets at 00:00 UTC with the dailies\n' +
           '• `nh feed help …` works the same as `nh feed …`',
+      },
+    ],
+  },
+
+  reports: {
+    title: '📝 Report helper',
+    description:
+      '`n r` shows you a fact for 7 seconds, then asks you to pick it out of three ' +
+      'near-identical options within 13. Both halves are edits of the same message, so ' +
+      'I hold on to the info and tell you which option matches as soon as they appear.',
+    fields: [
+      {
+        name: 'How it reads',
+        value:
+          '`📝 report → :one:` — all three details matched, safe to pick\n' +
+          '`📝 report → probably :two: (2/3 match)` — best guess, check it yourself\n' +
+          '`📝 report → couldn\'t tell these apart` — two options scored the same',
+      },
+      {
+        name: 'Notes',
+        value:
+          '• Nothing to run — it fires on its own during `n r`\n' +
+          '• It matches on count, colour and place; all three must agree for a confident answer\n' +
+          '• It only reads what the game already showed you. It does not answer for you.',
       },
     ],
   },
