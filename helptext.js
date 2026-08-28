@@ -234,6 +234,9 @@ const TOPICS = {
         value:
           '• Nothing to run — it fires on its own during `n r`\n' +
           '• It matches on count, colour and place; all three must agree for a confident answer\n' +
+          '• No mention, so it will not ping you mid-timer\n' +
+          '• `nh off answers` turns it off · `nh on answers` back on\n' +
+          '  (that is separate from `nh off report`, which mutes the 10-minute reminder)\n' +
           '• It only reads what the game already showed you. It does not answer for you.',
       },
     ],

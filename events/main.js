@@ -220,11 +220,33 @@ const rememberUser = (user) => {
   if (user?.username) knownUsers.set(user.username.toLowerCase(), user.id);
 };
 
+/**
+ * Resolve a name the game bot printed back to a Discord user.
+ *
+ * Names arrive wrapped in markdown ("**_kazuto._**"), but a trailing dot is also
+ * a legitimate part of a Discord username — "slimysludge.", "mxrxsxki." — so
+ * stripping punctuation up front loses real matches. Try the name exactly as
+ * given first, and only then progressively looser forms.
+ */
 const findUserByUsername = (client, username) => {
-  const key = String(username ?? '').toLowerCase();
-  const id  = knownUsers.get(key);
-  if (id) return { id, username: key };
-  return client.users.cache.find(u => u.username.toLowerCase() === key) ?? null;
+  const raw = String(username ?? '').trim().toLowerCase();
+  if (!raw) return null;
+
+  const variants = [
+    raw,
+    raw.replace(/^[*_~`]+|[*_~`]+$/g, ''),   // markdown only
+    raw.replace(/^[_.\s]+|[_.\s]+$/g, ''),   // legacy: also trims dots
+  ].filter((v, i, a) => v && a.indexOf(v) === i);
+
+  for (const v of variants) {
+    const id = knownUsers.get(v);
+    if (id) return { id, username: v };
+  }
+  for (const v of variants) {
+    const hit = client.users.cache.find(u => u.username.toLowerCase() === v);
+    if (hit) return hit;
+  }
+  return null;
 };
 
 const resolveUserId = (client, username) => findUserByUsername(client, username)?.id ?? null;
@@ -882,7 +904,7 @@ const handleBotMessage = async (message, client) => {
     }
   } else if (reports.P.stageWriting.test(text)) {
     const riddle = reportRiddles.get(message.id);
-    if (riddle && !riddle.answered) {
+    if (riddle && !riddle.answered && !isMuted(ownerId, 'answers')) {
       riddle.answered = true;
       const options = reports.parseOptions(text);
       // Plain name, not a mention — this fires while you're watching the timer.
@@ -1133,18 +1155,29 @@ const handleUserMessage = async (message, client) => {
   // ── nh on/off <command> — mute individual reminders ──────────────────────
   const muteMatch = lower.match(/^nh\s+(on|off)\s+(\w+)$/);
   if (muteMatch) {
-    const [, verb, target] = muteMatch;
-    const known = new Set([...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'all']);
+    const [, verb, raw] = muteMatch;
+    // "report" is the 10-minute reminder; "answers" is the report *helper*.
+    // Keep them distinct so muting one can't silently kill the other.
+    const MUTE_ALIASES = { reporthelper: 'answers', answer: 'answers', helper: 'answers' };
+    const target = MUTE_ALIASES[raw] ?? raw;
+
+    const known = new Set([
+      ...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'answers', 'all',
+    ]);
     if (!known.has(target)) {
       await safeSend(message.channel,
-        `<@${userId}> unknown reminder **${target}**. Options: ${[...known].join(', ')}`);
+        `<@${userId}> unknown reminder **${raw}**. Options: ${[...known].join(', ')}`);
       return;
     }
+
     await setMuted(userId, target, verb === 'off');
+    const what = target === 'answers' ? 'report answer helper'
+               : target === 'digest'  ? 'daily digest'
+               : `**${target}** reminders`;
     await safeSend(message.channel,
       verb === 'off'
-        ? `<@${userId}> 🔕 **${target}** reminders muted. \`nh on ${target}\` to undo.`
-        : `<@${userId}> 🔔 **${target}** reminders back on.`);
+        ? `<@${userId}> 🔕 ${what} muted. \`nh on ${target}\` to undo.`
+        : `<@${userId}> 🔔 ${what} back on.`);
     return;
   }
 
@@ -1338,7 +1371,8 @@ const processVoteShopPurchase = async (message, client) => {
   const userMatch = message.content.match(/was purchased by \*\*([^*]+)\*\*/i);
   if (!itemMatch || !userMatch) return;
 
-  const rawName  = userMatch[1].replace(/^[_.\s]+|[_.\s]+$/g, '');
+  // Pass the name through untouched — findUserByUsername handles the variants.
+  const rawName  = userMatch[1].trim();
   const user     = findUserByUsername(client, rawName);
   if (!user) return;
 
@@ -1375,7 +1409,8 @@ const processVoteShopCooldown = async (message, client) => {
   if (!itemMatch || !userMatch || !timeMatch) return;
 
   // strip Discord formatting chars from username: _kazuto._ → kazuto.
-  const rawName = userMatch[1].replace(/^[_.\s]+|[_.\s]+$/g, '');
+  // Pass the name through untouched — findUserByUsername handles the variants.
+  const rawName = userMatch[1].trim();
   const user    = findUserByUsername(client, rawName);
   if (!user) return;
 
