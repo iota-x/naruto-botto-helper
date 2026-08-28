@@ -674,6 +674,10 @@ const resolvePendingCommands = async (message, client) => {
 //   any other refusal                            → it did not eat; undo the log.
 const FEED_ALREADY_EATEN = /already eaten a daily food/i;
 
+// A mistyped or wrong id — the ninja definitely did not eat, and the routine
+// entry itself is probably wrong.
+const FEED_BAD_ID = /missing ninja id|no ninja with|invalid ninja/i;
+
 const processFeedReply = async (message, text, ownerId) => {
   const pending = recentFeeds.get(message.channel.id);
   if (!pending) return;
@@ -686,6 +690,16 @@ const processFeedReply = async (message, text, ownerId) => {
     await safeSend(message.channel,
       `<@${pending.userId}> **${pending.unitId}** had already eaten today — ` +
       `counting it as done, but that \`${pending.item}\` wasn't spent.`);
+    return;
+  }
+
+  if (FEED_BAD_ID.test(text)) {
+    recentFeeds.delete(message.channel.id);
+    await feed.unlogFeed(pending.key);
+    trace('feed bad id', { unit: pending.unitId });
+    await safeSend(message.channel,
+      `<@${pending.userId}> **${pending.unitId}** isn't a valid ninja id — left it unticked. ` +
+      `If it's in your routine, fix it with \`nh feed remove ${pending.unitId} ${pending.item}\`.`);
     return;
   }
 
@@ -918,6 +932,21 @@ const handleBotMessage = async (message, client) => {
     }
   } else if (reports.P.stageResult.test(text)) {
     reportRiddles.delete(message.id);
+  }
+
+  // Daily tier completions arrive as their own message and — unusually — mention
+  // the user outright, so they resolve even for someone we've never seen speak.
+  const tier = dailies.parseTierCompletion(text);
+  if (tier) {
+    const tierUser = message.mentions?.users?.first()?.id ?? ownerId;
+    if (tierUser) {
+      await dailies.applyTierCompletion(tierUser, tier);
+      // Tier rewards are real ryo income that nothing was recording.
+      if (tier.ryo) {
+        await xptracker.recordExternal(tierUser, 'daily_tier', 0, tier.ryo, `${message.id}:tier`);
+      }
+      trace('daily tier', { user: tierUser, label: tier.label, tier: tier.tier, ryo: tier.ryo });
+    }
   }
 
   await processFeedReply(message, text, ownerId);

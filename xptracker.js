@@ -260,4 +260,8 @@ const report = async (userId, unitFilter = null) => {
   return lines.join('\n');
 };
 
-module.exports = { observe, report, lastDailyReset, normaliseName };
+/** Record a gain the page-based `observe` doesn't cover (e.g. daily tier rewards). */
+const recordExternal = (userId, source, amount, ryo, key) =>
+  saveEvent(userId, source, amount, ryo, key);
+
+module.exports = { observe, report, lastDailyReset, normaliseName, recordExternal };

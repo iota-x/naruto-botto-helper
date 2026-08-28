@@ -23,6 +23,20 @@ const P = {
   reset:  /Resets\s*<t:(\d+)/i,
 };
 
+// Fired as its own message whenever a tier completes, e.g.
+//   ## Daily tier completed <@000000000000000000>!
+//   **Complete 30 missions** (T1) ✅
+//   **Reward**: 2000 ryo
+//   **Daily Chest bar** +20 → 40/600 🔐
+// Unlike the dailies page this one mentions the user outright.
+const TIER = {
+  header: /Daily tier completed/i,
+  task:   /\*\*(Complete|Challenge|Perform)\s+([\d,]+)\s+([^*]+?)\*\*\s*\((T\d)\)/i,
+  reward: /\*\*Reward\*\*:\s*([^\n]+)/i,
+  chest:  /\*\*Daily Chest bar\*\*\s*\+?([\d,]+)?\s*→\s*([\d,]+)\s*\/\s*([\d,]+)/i,
+  ryo:    /([\d,]+)\s*ryo/i,
+};
+
 const num = (s) => parseInt(String(s).replace(/[,\s]/g, ''), 10);
 
 // userId → timeout handle for the pending nudge
@@ -53,6 +67,47 @@ const parse = (text) => {
     chestTotal: chest ? num(chest[2]) : null,
     resetAt:    reset ? new Date(num(reset[1]) * 1000) : null,
   };
+};
+
+const parseTierCompletion = (text) => {
+  if (!TIER.header.test(text)) return null;
+
+  const task   = text.match(TIER.task);
+  const reward = text.match(TIER.reward);
+  const chest  = text.match(TIER.chest);
+  const ryo    = reward ? reward[1].match(TIER.ryo) : null;
+
+  return {
+    label:      task ? `${task[1]} ${task[3].trim()}`.replace(/\s+/g, ' ') : null,
+    tier:       task ? task[4] : null,
+    reward:     reward ? reward[1].trim() : null,
+    ryo:        ryo ? num(ryo[1]) : 0,
+    chestDone:  chest ? num(chest[2]) : null,
+    chestTotal: chest ? num(chest[3]) : null,
+  };
+};
+
+/**
+ * Fold a tier completion into the stored snapshot.
+ *
+ * Only the chest bar is updated. A completed tier often rolls the same task on
+ * to a higher target, so marking the task "done" here could wrongly silence the
+ * pre-reset nudge — `n d` stays the source of truth for what is still open.
+ */
+const applyTierCompletion = async (userId, tier) => {
+  if (tier.chestDone == null) return false;
+  try {
+    const snap = await latest(userId);
+    if (!snap) return false;
+    await Dailies.updateOne(
+      { _id: snap._id },
+      { $set: { chestDone: tier.chestDone, chestTotal: tier.chestTotal ?? snap.chestTotal } }
+    );
+    return true;
+  } catch (err) {
+    console.error(`[dailies] tier update failed: ${err.message}`);
+    return false;
+  }
 };
 
 const record = async (userId, channelId, parsed) => {
@@ -168,4 +223,7 @@ const restoreNudges = async (resolveChannel, isMuted) => {
   }
 };
 
-module.exports = { parse, record, report, scheduleNudge, restoreNudges, latest, remaining };
+module.exports = {
+  parse, record, report, scheduleNudge, restoreNudges, latest, remaining,
+  parseTierCompletion, applyTierCompletion,
+};
