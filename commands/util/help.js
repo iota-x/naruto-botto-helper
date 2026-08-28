@@ -14,7 +14,9 @@ module.exports = {
         'refusals no longer arm a reminder.'
       )
       .addFields(
-        { name: '⏰ Reminders', value: '`nh status` · `nh pause <Xh|Xm>` · `nh resume`' },
+        { name: '⏰ Reminders', value: '`nh status` · `nh pause <Xh|Xm>` · `nh resume`\n`nh off <cmd>` / `nh on <cmd>` · `nh mutes`' },
+        { name: '🍜 Feed routine', value: '`nh feed` — what\'s left today\n`nh feed set <lines>` · `nh feed add 223 rl` · `nh feed remove 4`' },
+        { name: '📜 Dailies & ryo', value: '`nh dailies` — progress + pre-reset nudge\n`nh ryo` — earned/spent and what your balance affords' },
         { name: '📈 XP', value: '`nh xp` — gains since reset, rate, level-up ETA\n`nh xp <name>` — one ninja\n`nh track xp <id>` · `nh end track xp <id>` — manual session' },
         { name: '📊 Stats', value: '`stats`' },
         { name: '⚙️ Utility', value: '`help` & `ping`', inline: false },

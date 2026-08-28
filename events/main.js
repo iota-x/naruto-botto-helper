@@ -1,6 +1,9 @@
 const database = require("../models/user");
 const { trace } = require("../debug");
 const xptracker = require("../xptracker");
+const dailies   = require("../dailies");
+const econ      = require("../econ");
+const feed      = require("../feed");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -120,6 +123,39 @@ const xpSessions = new Map();
 
 // userId → unixSeconds when pause expires
 const pausedUntil = new Map();
+
+// userId → Set of muted command names ("all" mutes everything).
+// Backed by user.disabled in Mongo; the schema field existed but nothing ever
+// read or wrote it until now.
+const mutedCommands = new Map();
+
+const isMuted = (userId, command) => {
+  const set = mutedCommands.get(userId);
+  return Boolean(set && (set.has('all') || set.has(command)));
+};
+
+const setMuted = async (userId, command, muted) => {
+  const set = mutedCommands.get(userId) ?? new Set();
+  if (muted) set.add(command); else set.delete(command);
+  if (command === 'all' && !muted) set.clear();
+  mutedCommands.set(userId, set);
+
+  database.collection.findOneAndUpdate(
+    { userId },
+    { $set: { disabled: Object.fromEntries([...set].map(c => [c, true])) } },
+    { upsert: true }
+  ).catch(err => console.error(`[db] mute write failed for ${userId}: ${err.message}`));
+};
+
+// Reminder counters — stats.reminders existed in the schema but was never
+// incremented, so /stats always showed zeros.
+const bumpStat = (userId, command) => {
+  database.collection.findOneAndUpdate(
+    { userId },
+    { $inc: { [`stats.reminders.${command}`]: 1 } },
+    { upsert: true }
+  ).catch(err => console.error(`[db] stat bump failed for ${userId}: ${err.message}`));
+};
 
 // ─── Stale-entry cleanup (every 10 min) ──────────────────────────────────────
 // Prevents the channel-keyed maps leaking when a fight or command is ignored
@@ -329,6 +365,8 @@ const saveCooldown = async (userId, command, cooldownSeconds, channel, client) =
       const check = cooldownCache.get(userId);
       if (check?.[command] !== expiryUnix) return; // superseded by a newer cooldown
       if (isReminderPaused(userId)) return;
+      if (isMuted(userId, command)) return;
+      bumpStat(userId, command);
       safeSend(channel, `<@${userId}> your **${command}** is ready!`);
     }, cooldownSeconds * 1000).unref();
   }
@@ -553,6 +591,8 @@ const restoreCooldownsFromDB = async (client) => {
           const check = cooldownCache.get(user.userId);
           if (check?.[command] !== entry.expiry) return;
           if (isReminderPaused(user.userId)) return;
+          if (isMuted(user.userId, command)) return;
+          bumpStat(user.userId, command);
 
           try {
             const channel = await client.channels.fetch(entry.channelId);
@@ -564,9 +604,24 @@ const restoreCooldownsFromDB = async (client) => {
       }
 
       if (Object.keys(userCache).length > 0) cooldownCache.set(user.userId, userCache);
+
+      // Reminder mutes live alongside the cooldowns
+      const muted = Object.entries(user.disabled ?? {})
+        .filter(([, off]) => off === true)
+        .map(([cmd]) => cmd);
+      if (muted.length) mutedCommands.set(user.userId, new Set(muted));
     }
 
     console.log(`[startup] Restored ${restored} cooldown(s) for ${users.length} user(s).`);
+
+    await dailies.restoreNudges(
+      async (channelId) => {
+        if (!channelId) return null;
+        try { return await client.channels.fetch(channelId); }
+        catch { return null; }
+      },
+      (userId) => isReminderPaused(userId) || isMuted(userId, 'dailies')
+    );
   } catch (err) {
     console.error('[startup] Failed to restore cooldowns:', err);
   }
@@ -609,8 +664,27 @@ const handleBotMessage = async (message, client) => {
   if (ownerId) {
     const noted = await xptracker.observe(message, text, ownerId);
     if (noted) trace('xp', { user: owner, noted });
+
+    // Dailies progress + pre-reset nudge
+    const daily = dailies.parse(text);
+    if (daily) {
+      await dailies.record(ownerId, message.channel.id, daily);
+      dailies.scheduleNudge(
+        ownerId, daily,
+        (t) => safeSend(message.channel, t),
+        () => isReminderPaused(ownerId) || isMuted(ownerId, 'dailies')
+      );
+      trace('dailies', { user: owner, open: dailies.remaining(daily).length });
+    }
+
+    // Balance snapshot, for "what can I afford"
+    const balance = econ.parseBalance(text);
+    if (balance) {
+      await econ.record(ownerId, balance);
+      trace('balance', { user: owner, ryo: balance.ryo });
+    }
   } else if (owner) {
-    trace('xp skipped — unknown user', { owner });
+    trace('observe skipped — unknown user', { owner });
   }
 
   // The V2 migration is PARTIAL. As of Aug 2026: mission/report/daily/weekly/
@@ -716,6 +790,61 @@ const handleUserMessage = async (message, client) => {
     return;
   }
 
+  // ── nh feed … — daily feed routine ───────────────────────────────────────
+  // Uses raw content, not `lower`: multi-line pastes and casing must survive.
+  const feedMatch = message.content.trim().match(/^nh\s+feed(?:\s+help)?\b([\s\S]*)$/i);
+  if (feedMatch) {
+    try {
+      await safeSend(message.channel, await feed.command(userId, feedMatch[1]));
+    } catch (err) {
+      console.error('[feed] command failed:', err);
+      await safeSend(message.channel, `<@${userId}> couldn't reach the feed routine right now.`);
+    }
+    return;
+  }
+
+  // ── nh dailies — progress toward today's set ─────────────────────────────
+  if (/^nh\s+(dailies|daily|d)$/.test(lower)) {
+    await safeSend(message.channel, await dailies.report(userId).catch(() =>
+      `<@${userId}> couldn't read dailies data right now.`));
+    return;
+  }
+
+  // ── nh ryo / nh econ — earnings, spend, and what the balance buys ────────
+  if (/^nh\s+(ryo|econ|economy|money)$/.test(lower)) {
+    await safeSend(message.channel, await econ.report(userId).catch(() =>
+      `<@${userId}> couldn't read economy data right now.`));
+    return;
+  }
+
+  // ── nh on/off <command> — mute individual reminders ──────────────────────
+  const muteMatch = lower.match(/^nh\s+(on|off)\s+(\w+)$/);
+  if (muteMatch) {
+    const [, verb, target] = muteMatch;
+    const known = new Set([...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'all']);
+    if (!known.has(target)) {
+      await safeSend(message.channel,
+        `<@${userId}> unknown reminder **${target}**. Options: ${[...known].join(', ')}`);
+      return;
+    }
+    await setMuted(userId, target, verb === 'off');
+    await safeSend(message.channel,
+      verb === 'off'
+        ? `<@${userId}> 🔕 **${target}** reminders muted. \`nh on ${target}\` to undo.`
+        : `<@${userId}> 🔔 **${target}** reminders back on.`);
+    return;
+  }
+
+  // ── nh mutes — what's currently silenced ─────────────────────────────────
+  if (/^nh\s+(mutes|toggles)$/.test(lower)) {
+    const set = mutedCommands.get(userId);
+    await safeSend(message.channel,
+      set?.size
+        ? `<@${userId}> muted: ${[...set].map(c => `**${c}**`).join(', ')}`
+        : `<@${userId}> nothing muted — all reminders are on.`);
+    return;
+  }
+
   // ── nh xp [name|id] — gains today, rate, and level-up ETA ────────────────
   const xpMatch = lower.match(/^nh\s+xp(?:\s+(.+))?$/);
   if (xpMatch) {
@@ -781,6 +910,14 @@ const handleUserMessage = async (message, client) => {
   if (lower === 'n cd') {
     cdCheckSuppressed.add(userId);
     setTimeout(() => cdCheckSuppressed.delete(userId), 5000).unref();
+    return;
+  }
+
+  // ── n feed <id> <item> — tick the routine off as you go ──────────────────
+  const fedMatch = lower.match(/^n\s+feed\s+(\d+)\s+(\S+)/);
+  if (fedMatch) {
+    await feed.logFeed(userId, fedMatch[1], fedMatch[2], message.id);
+    trace('feed logged', { user: message.author.username, unit: fedMatch[1], item: fedMatch[2] });
     return;
   }
 
