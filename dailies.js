@@ -162,8 +162,9 @@ const report = async (userId) => {
  *
  * @param send      async (text) => void — how to deliver the nudge
  * @param isMuted   () => boolean — checked at fire time, not schedule time
+ * @param extras    async (userId) => string[] — extra sections (e.g. feeds still due)
  */
-const scheduleNudge = (userId, parsed, send, isMuted) => {
+const scheduleNudge = (userId, parsed, send, isMuted, extras) => {
   const existing = nudges.get(userId);
   if (existing) clearTimeout(existing);
 
@@ -178,16 +179,30 @@ const scheduleNudge = (userId, parsed, send, isMuted) => {
       if (isMuted?.()) return;
       const snap = await latest(userId);
       const left = remaining(snap);
-      if (!left.length) return; // all done — stay quiet
 
-      const reset = snap.resetAt
+      // Anything else on the same 24h clock — feeds, most importantly. An
+      // unfed ninja is XP that cannot be recovered once the day rolls over,
+      // so the nudge fires for that alone even when the dailies are done.
+      const extraSections = (await extras?.(userId)) ?? [];
+
+      if (!left.length && !extraSections.length) return; // genuinely nothing left
+
+      const reset = snap?.resetAt
         ? `<t:${Math.floor(new Date(snap.resetAt).getTime() / 1000)}:R>`
         : 'soon';
-      await send(
-        `<@${userId}> ⏰ dailies reset ${reset} — still open:\n` +
-        left.map(t => `> **${fmt(t.total - t.done)}** more · ${t.label}`).join('\n') +
-        `\n-# \`nh off dailies\` to stop these`
-      );
+
+      const parts = [`<@${userId}> ⏰ **last call** — everything resets ${reset}`];
+
+      if (left.length) {
+        parts.push(
+          '\n📜 **Dailies**\n' +
+          left.map(t => `> **${fmt(t.total - t.done)}** more · ${t.label}`).join('\n')
+        );
+      }
+      for (const section of extraSections) parts.push(`\n${section}`);
+
+      parts.push('-# `nh off dailies` to stop these');
+      await send(parts.join('\n'));
     } catch (err) {
       console.error(`[dailies] nudge failed for ${userId}: ${err.message}`);
     }
@@ -199,7 +214,7 @@ const scheduleNudge = (userId, parsed, send, isMuted) => {
 };
 
 /** Rebuild pending nudges after a restart. */
-const restoreNudges = async (resolveChannel, isMuted) => {
+const restoreNudges = async (resolveChannel, isMuted, extras) => {
   try {
     const recent = await Dailies.aggregate([
       { $sort: { at: -1 } },
@@ -209,12 +224,13 @@ const restoreNudges = async (resolveChannel, isMuted) => {
     let armed = 0;
     for (const { doc } of recent) {
       if (!doc.resetAt || new Date(doc.resetAt) <= new Date()) continue;
-      if (!remaining(doc).length) continue;
+      // Arm even when the dailies are already done — feeds may still be due,
+      // and the nudge re-checks everything at fire time anyway.
 
       const channel = await resolveChannel(doc.channelId);
       if (!channel) continue;
 
-      scheduleNudge(doc.userId, doc, (t) => channel.send(t), () => isMuted(doc.userId));
+      scheduleNudge(doc.userId, doc, (t) => channel.send(t), () => isMuted(doc.userId), extras);
       armed++;
     }
     console.log(`[startup] Armed ${armed} dailies nudge(s).`);

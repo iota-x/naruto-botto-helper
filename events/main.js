@@ -720,6 +720,28 @@ const processFeedReply = async (message, text, ownerId) => {
   if (ownerId === pending.userId) recentFeeds.delete(message.channel.id);
 };
 
+/**
+ * Extra sections for the pre-reset nudge. Feeding runs on the same 24h clock as
+ * the dailies, and an unfed ninja is XP that can't be recovered once the day
+ * rolls over — so it belongs in the last call, not just in `nh feed`.
+ */
+const nudgeExtras = async (userId) => {
+  const sections = [];
+  try {
+    const { entries, total, done } = await feed.pending(userId);
+    if (entries.length) {
+      sections.push(
+        `🍜 **Feeds** — ${done}/${total} done\n` +
+        entries.slice(0, 8).map(e => `> \`${feed.commandFor(e)}\``).join('\n') +
+        (entries.length > 8 ? `\n> -# +${entries.length - 8} more` : '')
+      );
+    }
+  } catch (err) {
+    console.error(`[nudge] feed section failed for ${userId}: ${err.message}`);
+  }
+  return sections;
+};
+
 const persistQuiet = async (userId, cfg) => {
   database.collection.findOneAndUpdate(
     { userId },
@@ -866,7 +888,8 @@ const restoreCooldownsFromDB = async (client) => {
         try { return await client.channels.fetch(channelId); }
         catch { return null; }
       },
-      (userId) => isReminderPaused(userId) || isMuted(userId, 'dailies')
+      (userId) => isReminderPaused(userId) || isMuted(userId, 'dailies'),
+      nudgeExtras
     );
   } catch (err) {
     console.error('[startup] Failed to restore cooldowns:', err);
@@ -989,7 +1012,8 @@ const handleBotMessage = async (message, client) => {
       dailies.scheduleNudge(
         ownerId, daily,
         (t) => safeSend(message.channel, t),
-        () => isReminderPaused(ownerId) || isMuted(ownerId, 'dailies')
+        () => isReminderPaused(ownerId) || isMuted(ownerId, 'dailies'),
+        nudgeExtras
       );
       trace('dailies', { user: owner, open: dailies.remaining(daily).length });
     }

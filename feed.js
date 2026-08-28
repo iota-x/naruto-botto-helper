@@ -335,6 +335,28 @@ const command = async (userId, rest) => {
 };
 
 /**
+ * Which routine lines are still due today. Used by the pre-reset nudge, so it
+ * returns data rather than the formatted `show()` string.
+ */
+const pending = async (userId) => {
+  const routine = await getRoutine(userId);
+  const entries = routine?.entries ?? [];
+  if (!entries.length) return { entries: [], total: 0, done: 0 };
+
+  const states = progress(entries, await todaysLog(userId));
+  const doable = states.filter(s => s.state !== 'blocked').length;
+
+  return {
+    entries: entries.filter((_, i) => states[i].state === 'pending'),
+    total:   doable,
+    done:    states.filter(s => s.state === 'done').length,
+  };
+};
+
+/** The literal command to send for a routine entry. */
+const commandFor = (entry) => line(entry);
+
+/**
  * Undo a feed log — used when the game refuses the command for a reason that
  * means the ninja did *not* eat. "Already eaten a daily food" is deliberately
  * not one of those: the ninja is fed either way, so the routine line stands.
@@ -351,5 +373,5 @@ const unlogFeed = async (key) => {
 
 module.exports = {
   command, show, logFeed, unlogFeed, ITEMS, normItem, itemInfo, parseEntries,
-  parseStock, recordStock, getStock,
+  parseStock, recordStock, getStock, pending, commandFor,
 };
