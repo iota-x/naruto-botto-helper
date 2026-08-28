@@ -2,7 +2,9 @@
 // Single source of truth for what the bot does. Kept apart from the command so
 // the text is easy to keep in step with the code as features land.
 
-const OWNER_ID = '000000000000000000';
+// Configured via OWNER_ID in .env; kept out of the source so a public copy of
+// this repo carries nobody's Discord id.
+const OWNER_ID = process.env.OWNER_ID || null;
 
 // Cooldowns the bot arms, in the order they matter day to day.
 const COOLDOWNS = [
@@ -334,7 +336,7 @@ const TOPICS = {
 
   admin: {
     title: '🗄️ Admin',
-    description: `Owner only (<@${OWNER_ID}>). Everything here touches the database directly.`,
+    description: `Owner only${OWNER_ID ? ` (<@${OWNER_ID}>)` : ''}. Everything here touches the database directly.`,
     fields: [
       {
         name: 'Inspect',

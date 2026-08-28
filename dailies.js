@@ -24,7 +24,7 @@ const P = {
 };
 
 // Fired as its own message whenever a tier completes, e.g.
-//   ## Daily tier completed <@000000000000000000>!
+//   ## Daily tier completed <@user id>!
 //   **Complete 30 missions** (T1) ✅
 //   **Reward**: 2000 ryo
 //   **Daily Chest bar** +20 → 40/600 🔐

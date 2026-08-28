@@ -1,12 +1,14 @@
 const database = require("../models/user");
 
-const AUTHORIZED_ID = '000000000000000000';
+// Who may run the destructive `nh db …` commands. Set OWNER_ID in .env.
+// Fails closed: with nothing configured, nobody is authorised.
+const AUTHORIZED_ID = process.env.OWNER_ID || null;
 
 module.exports = {
   name: "messageCreate",
   once: false,
   async execute(message, client) {
-    if (message.author.id !== AUTHORIZED_ID) return;
+    if (!AUTHORIZED_ID || message.author.id !== AUTHORIZED_ID) return;
     if (message.author.bot) return;
 
     const lower = message.content.trim().toLowerCase();

@@ -10,7 +10,7 @@
 //   DEBUG_TRACE=1                      log why main.js armed/dropped a cooldown
 //
 // Example:
-//   DEBUG_CAPTURE=000000000000000000 DEBUG_CAPTURE_FILE=./capture.jsonl npm start
+//   DEBUG_CAPTURE=<channel id> DEBUG_CAPTURE_FILE=./capture.jsonl npm start
 
 const fs = require('fs');
 

@@ -1,6 +1,7 @@
 node_modules
 .env
 .env.*
+!.env.example
 capture.jsonl
 *.jsonl
 .DS_Store
