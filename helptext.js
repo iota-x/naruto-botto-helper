@@ -206,10 +206,11 @@ const TOPICS = {
       {
         name: 'Notes',
         value:
-          '• Run `n pass` once so there is something to read\n' +
+          '• Run `n pass` once so there is something to read; level-ups update it too\n' +
           '• `nh off digest` stops the automatic post\n' +
-          '• The pass page has not been captured yet, so `nh pass` will say plainly ' +
-          'which fields it could not read rather than inventing them.',
+          '• 60 levels a month for everyone — Deluxe/Ultra multiply the *rewards*, ' +
+          'not the level count, and the page names all three tiers to everybody, ' +
+          'so which one you own is not inferred from it.',
       },
     ],
   },
