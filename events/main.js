@@ -345,15 +345,24 @@ const extractOwner = (text) => {
 
 // Where the bot states the real cooldown, use it instead of our fixed table.
 const DURATION_FROM_TEXT = {
-  // "Resets <t:1787961600:R> ⏰"
+  // Two different clocks live on the dailies page and they do not coincide:
+  //   "Resets <t:…>"                        — when the *tasks* roll over (00:00 UTC)
+  //   "Claim your Daily reward in 4h 3m"    — when the *ryo reward* can be claimed
+  // The reminder is about claiming, so the button wins. Seen live: `n cd` said
+  // Daily 4h 7m while the same page said it resets in 6h.
   daily: (text) => {
-    const m = text.match(/resets?\s*<t:(\d+)/i);
-    return m ? parseInt(m[1]) - Math.floor(Date.now() / 1000) : null;
+    const claim = text.match(/claim your daily reward in\s+([0-9dhms\s]+)/i);
+    if (claim) return parseTimeString(claim[1].trim());
+    // No "in …" on the button means it is claimable right now.
+    if (/claim your daily reward\b/i.test(text)) return 0;
+    return null;
   },
   // "🎁 Your next weekly reward is in **6d 23h 54m 21s**."
   weekly: (text) => {
     const m = text.match(/next weekly reward is in\s*\*{0,2}\s*([0-9dhms\s]+)/i);
-    return m ? parseTimeString(m[1].trim()) : null;
+    if (!m) return null;
+    const secs = parseTimeString(m[1].trim());
+    return secs > 0 ? secs : null;   // a zero here means the parse failed, not "ready"
   },
 };
 
@@ -567,9 +576,11 @@ const resolvePendingCommands = async (message, client) => {
 
     // The bot usually states the real cooldown ("Resets <t:...>", "next weekly
     // reward is in 6d 23h..."). Trust that over our fixed table when present.
+    // A stated 0 is meaningful — "claimable right now" — so it must not fall
+    // through to the table the way a failed parse (null) does.
     const stated = DURATION_FROM_TEXT[entry.command]?.(text) ?? null;
-    const source = stated !== null && stated > 0 ? 'stated' : 'table';
-    const seconds = source === 'stated' ? stated : durationFor(entry.command);
+    const source = stated !== null ? 'stated' : 'table';
+    const seconds = stated !== null ? stated : durationFor(entry.command);
 
     const armed = await saveCooldown(entry.userId, entry.command, seconds, message.channel, client, {
       authority: source === 'stated' ? AUTHORITY.stated
@@ -643,9 +654,9 @@ const resolvePendingCommands = async (message, client) => {
     for (const [command, patterns] of Object.entries(CONFIRM_PATTERNS)) {
       if (!patterns[0].test(text)) continue;
       const stated  = DURATION_FROM_TEXT[command]?.(text) ?? null;
-      const seconds = stated !== null && stated > 0 ? stated : durationFor(command);
+      const seconds = stated !== null ? stated : durationFor(command);
       await saveCooldown(user.id, command, seconds, message.channel, client, {
-        authority: stated !== null && stated > 0 ? AUTHORITY.stated
+        authority: stated !== null ? AUTHORITY.stated
                  : DYNAMIC_DURATIONS[command] ? AUTHORITY.derived
                  : AUTHORITY.table,
       });
