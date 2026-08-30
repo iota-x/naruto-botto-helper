@@ -1,3 +1,4 @@
+const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 const database = require("../models/user");
 const { trace } = require("../debug");
 const xptracker = require("../xptracker");
@@ -9,10 +10,14 @@ const quiet     = require("../quiet");
 const digest    = require("../digest");
 const monthly   = require("../pass");
 const jutsu     = require("../jutsu");
+const invasion  = require("../invasion");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const NARUTO_BOT_ID = '770100332998295572';
+const {
+  GAME_BOT_ID: NARUTO_BOT_ID, REPORT_ANSWER_CHANNELS,
+} = require('../config');
+const { Setting } = require('../models/tracking');
 
 // August 2026 patch: quests were folded into `n daily`. Dailies are one set per
 // day, auto-claimed, and reset at 00:00 UTC (05:30 IST) — not a rolling 20h.
@@ -41,8 +46,10 @@ const RETIRED_COMMANDS = new Set(['quest', 'quests', 'adventure']);
 // Names the game bot uses that differ from our internal keys.
 const COMMAND_ALIASES = { dailies: 'daily', dq: 'daily' };
 
-// Short cooldowns — kept in memory only, never written to DB
-const MEMORY_ONLY = new Set(['mission', 'report']);
+// Cooldowns deliberately not persisted. This used to hold mission and report to
+// save DB writes, but a restart then lost them outright while every other
+// cooldown came back. An upsert a minute is cheap; a dropped reminder is not.
+const MEMORY_ONLY = new Set();
 
 // Max age for pending challenge entries before we clean them up
 const PENDING_TTL_MS = 5 * 60 * 1000;
@@ -107,6 +114,58 @@ const CONFIRM_PATTERNS = {
 // userId → { [command]: unixExpirySeconds }
 const cooldownCache = new Map();
 
+// `${userId}:${command}` → the channel that cooldown was armed in, so the ping
+// lands where the command was actually run.
+const cooldownChannels = new Map();
+const ckey = (userId, command) => `${userId}:${command}`;
+
+// ─── Report-answer whitelist ──────────────────────────────────────────────────
+// Channels allowed to see which option to click. Seeded from
+// REPORT_ANSWER_CHANNELS, then owned at runtime so an admin can change it from
+// Discord without a redeploy. Persisted so a restart doesn't quietly re-open or
+// re-close channels.
+const REPORT_SETTING_KEY = 'reportAnswerChannels';
+const reportChannels = new Set(REPORT_ANSWER_CHANNELS);
+
+const mayShowReportOption = (channelId) => reportChannels.has(channelId);
+
+const loadReportChannels = async () => {
+  try {
+    const row = await Setting.findOne({ key: REPORT_SETTING_KEY }).lean();
+    if (Array.isArray(row?.value)) {
+      for (const id of row.value) reportChannels.add(id);
+    }
+  } catch (err) {
+    console.error(`[settings] Could not load report whitelist: ${err.message}`);
+  }
+  return reportChannels.size;
+};
+
+const saveReportChannels = async () => {
+  try {
+    await Setting.updateOne(
+      { key: REPORT_SETTING_KEY },
+      { $set: { value: [...reportChannels], at: new Date() } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error(`[settings] Could not save report whitelist: ${err.message}`);
+  }
+};
+
+// Who may change it: the bot owner, or anyone who can manage the server.
+const canManageChannels = (message) => {
+  if (process.env.OWNER_ID && message.author.id === process.env.OWNER_ID) return true;
+  try {
+    const p = message.member?.permissions;
+    return Boolean(p?.has?.('Administrator') || p?.has?.('ManageGuild') || p?.has?.('ManageChannels'));
+  } catch { return false; }
+};
+
+// userId → when we last saw them actually do something, so a reminder that goes
+// unheeded can tell "was around and skipped it" from "had logged off".
+const lastActivityAt = new Map();
+
 // channelId → [{ userId, command, messageId, timestamp }]
 // Commands the user typed that are waiting for the game bot to confirm them.
 const pendingCommands = new Map();
@@ -121,7 +180,75 @@ const pendingChallenges = new Map();
 const recentChallenges = new Map();
 
 // userId — suppresses reminder bursts from "n cd" checks
+// ─── Per-user timezone ────────────────────────────────────────────────────────
+// Every window the helper understands — quiet hours, `nh pause train 16:00-05:30`
+// — is a wall-clock time, which means nothing without a zone. It used to assume
+// IST for everybody. That is right for most of this server and silently wrong
+// for everyone else, whose mute windows landed hours off.
+//
+// So each account carries its own, set once with `nh tz`. Prefer an IANA name
+// over a fixed offset: it follows daylight saving by itself.
+const userTz = new Map();   // userId → minutes offset, or an IANA zone string
+
+const tzFor = (userId) => userTz.get(userId) ?? quiet.DEFAULT_TZ_MINUTES;
+
+const persistTz = (userId, tz) =>
+  database.collection.findOneAndUpdate(
+    { userId }, { $set: { tz } }, { upsert: true }
+  ).catch(err => console.error(`[db] tz write failed for ${userId}: ${err.message}`));
+
+/**
+ * The timezone picker.
+ *
+ * Typing "Europe/Berlin" assumes you know your zone's name; most people do not.
+ * Everyone does know what time it is where they are, so each row leads with that
+ * zone's current clock and you pick the one matching your watch. Typing still
+ * works for anyone who prefers it.
+ */
+const buildTzPicker = (userId) => {
+  const current = userTz.get(userId);
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`tz:${userId}`)          // the id is the lock — see handleComponent
+    .setPlaceholder('Pick the row showing your current time')
+    .addOptions(quiet.zoneChoices().map(({ zone, where, clock, offset }) => {
+      const sign = offset < 0 ? '-' : '+';
+      const a = Math.abs(offset);
+      return {
+        label: `${clock} — ${where}`.slice(0, 100),
+        description: `${zone} · UTC${sign}${String(Math.floor(a / 60)).padStart(2, '0')}:${String(a % 60).padStart(2, '0')}`.slice(0, 100),
+        value: zone,
+        default: current === zone,
+      };
+    }));
+  return new ActionRowBuilder().addComponents(menu);
+};
+
+/** Store a timezone and re-anchor anything already expressed in wall-clock time. */
+const applyTimezone = async (userId, tz) => {
+  userTz.set(userId, tz);
+  await persistTz(userId, tz);
+
+  // Existing windows were stored against the old zone; move them across so the
+  // times someone typed keep meaning what they meant.
+  const cfg = quiet.getConfig(userId);
+  if (cfg) {
+    const moved = { ...cfg, tz };
+    quiet.setConfig(userId, moved);
+    await persistQuiet(userId, moved);
+  }
+  return cfg;
+};
+
+// Channel ids where someone just typed `n cd`, so the resulting page is silent.
 const cdCheckSuppressed = new Set();
+
+// message id → when we first announced it. Edits of the same cooldown page must
+// not produce a second "reminders added". Swept hourly; entries are tiny.
+const cdAnnounced = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [id, at] of cdAnnounced) if (at < cutoff) cdAnnounced.delete(id);
+}, 30 * 60 * 1000).unref();
 
 // `${userId}:${unitId}` → { startXp, timestamp, pending, pendingEnd, endChannelId }
 const xpSessions = new Map();
@@ -137,28 +264,104 @@ const recentFeeds = new Map();
 // userId → unixSeconds when pause expires
 const pausedUntil = new Map();
 
-// userId → Set of muted command names ("all" mutes everything).
-// Backed by user.disabled in Mongo; the schema field existed but nothing ever
-// read or wrote it until now.
+// userId → Map<command, rule>, where "all" covers everything. A rule is one of:
+//
+//   true                        muted indefinitely      nh off train
+//   { until: unixSeconds }      muted for a while       nh pause train 2h
+//   { startMin, endMin, tz }    muted daily in a window nh pause train 16:00-05:30
+//   { auto: true }              the bot gave up on its own — see deliverReminder
+//
+// Backed by user.disabled in Mongo. The old shape was a plain map of
+// command → true, which still reads correctly as the first form.
 const mutedCommands = new Map();
 
-const isMuted = (userId, command) => {
-  const set = mutedCommands.get(userId);
-  return Boolean(set && (set.has('all') || set.has(command)));
+// "report" is the 10-minute reminder; "answers" is the report *helper*. Keeping
+// them distinct means muting one can never silently kill the other.
+const MUTE_ALIASES = { reporthelper: 'answers', answer: 'answers', helper: 'answers' };
+
+// Everything that can be silenced. Built once so `nh off`, `nh pause <cmd>` and
+// the error messages can never drift apart.
+const MUTABLE = new Set([
+  ...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'answers', 'jutsu',
+  'invasion', 'all',
+]);
+
+const ruleActive = (rule) => {
+  if (!rule) return false;
+  if (rule === true) return true;
+  if (rule.auto) return true;
+  if (rule.until) return rule.until > Math.floor(Date.now() / 1000);
+  if (rule.startMin != null) return quiet.withinWindow(rule);
+  return false;
 };
 
-const setMuted = async (userId, command, muted) => {
-  const set = mutedCommands.get(userId) ?? new Set();
-  if (muted) set.add(command); else set.delete(command);
-  if (command === 'all' && !muted) set.clear();
-  mutedCommands.set(userId, set);
+const isMuted = (userId, command) => {
+  const rules = mutedCommands.get(userId);
+  if (!rules) return false;
+  return ruleActive(rules.get('all')) || ruleActive(rules.get(command));
+};
 
+const describeRule = (rule) => {
+  if (rule === true) return 'off';
+  if (rule?.auto) return 'resting — you weren\'t using it';
+  if (rule?.until) return `until <t:${rule.until}:t>`;
+  if (rule?.startMin != null) return `daily ${quiet.describeWindow(rule)}`;
+  return 'off';
+};
+
+const persistMutes = (userId, rules) => {
+  const doc = {};
+  for (const [cmd, rule] of rules) doc[cmd] = rule;
   database.collection.findOneAndUpdate(
     { userId },
-    { $set: { disabled: Object.fromEntries([...set].map(c => [c, true])) } },
+    { $set: { disabled: doc } },
     { upsert: true }
   ).catch(err => console.error(`[db] mute write failed for ${userId}: ${err.message}`));
 };
+
+const setMuted = async (userId, command, rule) => {
+  const rules = mutedCommands.get(userId) ?? new Map();
+  if (rule) rules.set(command, rule); else rules.delete(command);
+  if (command === 'all' && !rule) rules.clear();   // "on all" clears everything
+  mutedCommands.set(userId, rules);
+  persistMutes(userId, rules);
+};
+
+// ─── Listening back ───────────────────────────────────────────────────────────
+// Not everyone is grinding. Plenty of players open the game, run their daily,
+// and leave — and the helper used to keep pinging them for every cooldown they
+// ever armed, which is noise to someone who was never coming back that session.
+//
+// Nobody should have to read the docs to escape that, so the bot works it out.
+// Each reminder is judged by what the player does next: run the command soon
+// after and the reminder did its job; run it hours later, or never, and it did
+// not. Three unheeded reminders in a row for one command and that command rests
+// — with a note saying so and how to undo it.
+//
+// It heals on its own too. Come back and actually grind something and its
+// reminders return without anyone typing a command.
+const IGNORE_LIMIT     = 3;               // unheeded reminders before resting
+const GRIND_RUNS       = 3;               // runs inside the window = back to it
+const GRIND_WINDOW_MS  = 60 * 60 * 1000;
+
+/**
+ * How soon after a reminder a run still counts as "that ping worked".
+ *
+ * One fixed window cannot serve a 60-second mission and a 20-hour daily. Half a
+ * minute is nothing to a mission grinder, while someone who gets their daily
+ * ping at 4pm and does it after dinner was plainly reminded — judging that on a
+ * 45-minute clock would rest the one reminder casual players actually want.
+ * So the window is half the command's own cooldown, floored and capped.
+ */
+const ackWindowMs = (command) => {
+  const seconds = durationFor(command);
+  const half    = Number.isFinite(seconds) ? (seconds * 1000) / 2 : 0;
+  return Math.min(Math.max(half, 45 * 60 * 1000), 12 * 60 * 60 * 1000);
+};
+
+const remindedAt    = new Map();  // ckey → ms the outstanding reminder went out
+const ignoredStreak = new Map();  // ckey → consecutive reminders not acted on
+const recentRuns    = new Map();  // ckey → recent run timestamps
 
 // Reminder counters — stats.reminders existed in the schema but was never
 // incremented, so /stats always showed zeros.
@@ -168,6 +371,82 @@ const bumpStat = (userId, command) => {
     { $inc: { [`stats.reminders.${command}`]: 1 } },
     { upsert: true }
   ).catch(err => console.error(`[db] stat bump failed for ${userId}: ${err.message}`));
+};
+
+/**
+ * Called when the game bot confirms a command actually ran. Settles whatever
+ * reminder was outstanding for it, and notices a player picking a command back
+ * up so a rested reminder can wake itself.
+ */
+const noteCommandRun = (userId, command) => {
+  const key = ckey(userId, command);
+  const now = Date.now();
+
+  const sentAt = remindedAt.get(key);
+  if (sentAt !== undefined) {
+    remindedAt.delete(key);
+    // Read before the caller stamps this run, so it means "the last thing they
+    // did *before* now".
+    const previously = lastActivityAt.get(userId) ?? 0;
+
+    if (now - sentAt <= ackWindowMs(command)) {
+      ignoredStreak.delete(key);            // the ping did its job
+    } else if (previously > sentAt) {
+      // They were around after the ping, doing other things, and still left this
+      // one. That is a choice about this command.
+      ignoredStreak.set(key, (ignoredStreak.get(key) ?? 0) + 1);
+    }
+    // Otherwise they simply logged off. That says nothing about whether they
+    // want the reminder, so it is not held against them.
+  }
+
+  const runs = (recentRuns.get(key) ?? []).filter((t) => now - t < GRIND_WINDOW_MS);
+  runs.push(now);
+  recentRuns.set(key, runs);
+
+  // Playing it properly again — undo a rest the bot decided on, but never one
+  // the player set themselves.
+  if (runs.length >= GRIND_RUNS && mutedCommands.get(userId)?.get(command)?.auto) {
+    setMuted(userId, command, null);
+    ignoredStreak.delete(key);
+    console.log(`[reminders] ${command} for ${userId} woken — back in use`);
+  }
+};
+
+/**
+ * The single place a "your X is ready" ping leaves the bot.
+ */
+const deliverReminder = async (userId, command, channel) => {
+  if (isReminderPaused(userId) || isMuted(userId, command)) return;
+
+  const key = ckey(userId, command);
+  let note  = '';
+
+  if ((ignoredStreak.get(key) ?? 0) >= IGNORE_LIMIT) {
+    await setMuted(userId, command, { auto: true });
+    ignoredStreak.delete(key);
+    recentRuns.delete(key);
+    console.log(`[reminders] ${command} for ${userId} resting — ${IGNORE_LIMIT} unheeded`);
+    note = `\n-# last one — you haven't been using these. \`nh on ${command}\` brings them back.`;
+  }
+
+  bumpStat(userId, command);
+  // A watchdog re-send is the same reminder, so it must not reset the clock the
+  // acknowledgement is measured against.
+  if (!remindedAt.has(key)) remindedAt.set(key, Date.now());
+
+  // Held for quiet hours rather than delivered. The held queue is memory only,
+  // so this must stay unmarked: a restart should backfill it and hold it again,
+  // not treat it as already said.
+  if (quiet.deferReminder(userId, command, channel)) return;
+
+  await safeSend(channel, `<@${userId}> your **${command}** is ready!${note}`);
+
+  // `remindedAt` is memory only, so a restart forgets what has already been
+  // announced and the ready-backfill says it all over again. Writing the mark
+  // next to the cooldown lets the next boot tell "I was down when this expired"
+  // from "I already told them".
+  markNotified(userId, command);
 };
 
 // ─── Stale-entry cleanup (every 10 min) ──────────────────────────────────────
@@ -189,6 +468,15 @@ setInterval(() => {
     if (kept.length) pendingCommands.set(channelId, kept);
     else pendingCommands.delete(channelId);
   }
+  // Reminder bookkeeping. An outstanding reminder is kept for a week: someone
+  // who wanders back on day three still gets that ping scored honestly.
+  for (const [k, v] of remindedAt)
+    if (now - v > 7 * 24 * 60 * 60 * 1000) remindedAt.delete(k);
+  for (const [k, list] of recentRuns) {
+    const kept = list.filter(t => now - t < GRIND_WINDOW_MS);
+    if (kept.length) recentRuns.set(k, kept);
+    else recentRuns.delete(k);
+  }
 }, 10 * 60 * 1000).unref(); // .unref() — won't keep the process alive by itself
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -206,11 +494,30 @@ const retry = async (fn, retries = 4, delay = 1000) => {
   }
 };
 
+// Retries are only safe if the operation is idempotent, and sending a message is
+// not. A connect timeout means the *response* was lost, not necessarily the
+// request: Discord may well have created the message already. Retrying blind is
+// how one player got "your train is ready!" twice in the same second.
+//
+// Discord solves this properly. A message carrying a nonce with enforce_nonce
+// set is deduplicated server-side — a retry with the same nonce returns the
+// message that already exists instead of posting a second copy. So the nonce is
+// generated once per logical send and reused across every attempt.
+//
+// Nonces are capped at 25 characters, hence base36.
+let nonceSeq = 0;
+const nextNonce = () =>
+  `${Date.now().toString(36)}-${(nonceSeq = (nonceSeq + 1) % 1_000_000).toString(36)}`;
+
 // Never throws — silently logs if channel is deleted/inaccessible
-const safeSend = (channel, content) =>
-  retry(() => channel.send(content)).catch(err =>
+const safeSend = (channel, content) => {
+  const payload = typeof content === 'string' ? { content } : { ...content };
+  payload.nonce = nextNonce();
+  payload.enforceNonce = true;
+  return retry(() => channel.send(payload)).catch(err =>
     console.error(`[safeSend] channel ${channel.id}: ${err.message}`)
   );
+};
 
 // username → userId for everyone we've seen speak. The game bot names people in
 // its page headers but never mentions them, and client.users.cache is unreliable,
@@ -426,13 +733,9 @@ const armTimer = (userId, command, expiryUnix, channel) => {
       setTimeout(fire, left * 1000).unref();
       return;
     }
-    if (isReminderPaused(userId)) return;
-    if (isMuted(userId, command)) return;
-    bumpStat(userId, command);
-    // Inside quiet hours the ping is held, not dropped — it arrives in one
-    // summary when the window ends.
-    if (quiet.deferReminder(userId, command, channel)) return;
-    safeSend(channel, `<@${userId}> your **${command}** is ready!`);
+    // Mutes, quiet hours and the listening-back check all live in there.
+    deliverReminder(userId, command, channel)
+      .catch(err => console.error(`[reminder] ${command} for ${userId}: ${err.message}`));
   };
 
   const delay = Math.max(0, (expiryUnix - Math.floor(Date.now() / 1000)) * 1000);
@@ -473,6 +776,14 @@ const saveCooldown = async (userId, command, cooldownSeconds, channel, client, o
   userCache[command] = expiryUnix;
   cooldownCache.set(userId, userCache);
   setAuthority(userId, command, authority);
+  cooldownChannels.set(ckey(userId, command), channel);
+  // Order matters: noteCommandRun reads lastActivityAt to tell "was around and
+  // skipped it" from "had logged off", so it must run before this command
+  // overwrites that with now.
+  // Only a confirmed run settles a reminder — an `n cd` resync restates the same
+  // cooldowns and must never be mistaken for the player acting on a ping.
+  if (opts.ranNow) noteCommandRun(userId, command);
+  lastActivityAt.set(userId, Date.now());
 
   // Arm the reminder timer
   if (cooldownSeconds > 0) armTimer(userId, command, expiryUnix, channel);
@@ -481,12 +792,26 @@ const saveCooldown = async (userId, command, cooldownSeconds, channel, client, o
   if (!MEMORY_ONLY.has(command)) {
     database.collection.findOneAndUpdate(
       { userId },
-      { $set: { [`cooldowns.${command}`]: { expiry: expiryUnix, channelId } } },
+      { $set: {
+        [`cooldowns.${command}`]: { expiry: expiryUnix, channelId },
+        // Who is actually playing. Used to keep window announcements off people
+        // whose last command was months ago.
+        lastSeen: new Date(),
+      } },
       { upsert: true }
     ).catch(err => console.error(`[db] write failed for ${userId}/${command}: ${err.message}`));
   }
 
   return true;
+};
+
+/** Stamp a cooldown as announced, so a restart does not repeat the ping. */
+const markNotified = (userId, command) => {
+  if (MEMORY_ONLY.has(command)) return;
+  database.collection.findOneAndUpdate(
+    { userId, [`cooldowns.${command}`]: { $exists: true } },
+    { $set: { [`cooldowns.${command}.notifiedAt`]: Math.floor(Date.now() / 1000) } }
+  ).catch(err => console.error(`[db] notify mark failed for ${userId}/${command}: ${err.message}`));
 };
 
 // ─── Pending command confirmation ────────────────────────────────────────────
@@ -586,6 +911,7 @@ const resolvePendingCommands = async (message, client) => {
       authority: source === 'stated' ? AUTHORITY.stated
                : DYNAMIC_DURATIONS[entry.command] ? AUTHORITY.derived
                : AUTHORITY.table,
+      ranNow: true,
     });
     console.log(`[confirm] ${entry.command} ${armed ? 'confirmed' : 'already tracked'} for ${entry.username} (${seconds}s, ${source})`);
     trace(`commit ${entry.command}`, {
@@ -659,6 +985,7 @@ const resolvePendingCommands = async (message, client) => {
         authority: stated !== null ? AUTHORITY.stated
                  : DYNAMIC_DURATIONS[command] ? AUTHORITY.derived
                  : AUTHORITY.table,
+        ranNow: true,
       });
       trace(`commit ${command} (no armed intent)`, { user: user.username, seconds });
       return true;
@@ -832,6 +1159,13 @@ const buildNextReport = async (userId, username) => {
     }
   } catch { /* dailies data is optional here */ }
 
+  // Invasion — a fixed daily window rather than a cooldown, so it sits outside
+  // the "ready / coming up" split above.
+  if (!isMuted(userId, 'invasion')) {
+    const line = invasion.nextLine(userId);
+    if (line) lines.push(`\n${line}`);
+  }
+
   if (isReminderPaused(userId)) lines.push(`\n-# ⏸ reminders paused`);
   else if (quiet.isQuiet(userId)) lines.push(`\n-# 🌙 quiet hours — pings are being held`);
 
@@ -844,7 +1178,38 @@ const restoreCooldownsFromDB = async (client) => {
   console.log('[startup] Restoring cooldowns from DB...');
   try {
     const now   = Math.floor(Date.now() / 1000);
-    const users = await database.find({}).lean();
+    const rows  = await database.find({}).lean();
+
+    // There is no unique index on userId, so a player can own several documents
+    // — one account here has seven. Processing them one at a time meant the last
+    // document read *replaced* that user's cache instead of adding to it, so a
+    // straggler holding a single stale cooldown silently wiped the six live ones
+    // restored a moment earlier. Merge first, newest expiry per command wins.
+    const users = [];
+    const byId  = new Map();
+    for (const row of rows) {
+      const seen = byId.get(row.userId);
+      if (!seen) {
+        byId.set(row.userId, { ...row, cooldowns: { ...(row.cooldowns ?? {}) } });
+        users.push(byId.get(row.userId));
+        continue;
+      }
+      for (const [cmd, entry] of Object.entries(row.cooldowns ?? {})) {
+        if (!entry?.expiry) continue;
+        if (!seen.cooldowns[cmd] || entry.expiry > seen.cooldowns[cmd].expiry) {
+          seen.cooldowns[cmd] = entry;
+        }
+      }
+      // Settings live on whichever document happens to carry them.
+      seen.disabled = seen.disabled ?? row.disabled;
+      seen.quiet    = seen.quiet    ?? row.quiet;
+      seen.tz       = seen.tz       ?? row.tz;
+    }
+    if (rows.length !== users.length) {
+      console.warn(`[startup] ${rows.length} documents collapsed to ${users.length} players ` +
+        `— ${rows.length - users.length} duplicate row(s); run \`nh db dedupe\` to clean up.`);
+    }
+
     let restored = 0;
 
     for (const user of users) {
@@ -858,12 +1223,6 @@ const restoreCooldownsFromDB = async (client) => {
         if (!entry?.expiry || !entry?.channelId) continue; // skip malformed
 
         const remaining = entry.expiry - now;
-        if (remaining <= 0) continue;
-
-        userCache[command] = entry.expiry;
-        cooldownCache.set(user.userId, userCache); // armTimer reads this
-        setAuthority(user.userId, command, AUTHORITY.table); // unknown provenance
-        restored++;
 
         // Resolve the channel lazily so one dead channel can't stall startup.
         const lazyChannel = {
@@ -873,20 +1232,41 @@ const restoreCooldownsFromDB = async (client) => {
             return channel.send(content);
           },
         };
+
+        // Expired while we were down. A person is not waiting on us: they play on
+        // their own schedule, they can see the cooldown with `nh next`, and a ping
+        // fired because the bot happened to reboot is noise. Restarts are silent.
+        if (remaining <= 0) continue;
+
+        userCache[command] = entry.expiry;
+        cooldownCache.set(user.userId, userCache); // armTimer reads this
+        setAuthority(user.userId, command, AUTHORITY.table); // unknown provenance
+        restored++;
+
+        cooldownChannels.set(ckey(user.userId, command), lazyChannel);
         armTimer(user.userId, command, entry.expiry, lazyChannel);
       }
 
       if (Object.keys(userCache).length > 0) cooldownCache.set(user.userId, userCache);
 
-      // Reminder mutes live alongside the cooldowns
-      const muted = Object.entries(user.disabled ?? {})
-        .filter(([, off]) => off === true)
-        .map(([cmd]) => cmd);
-      if (muted.length) mutedCommands.set(user.userId, new Set(muted));
+      // Reminder mutes live alongside the cooldowns. Values may be `true`
+      // (legacy, indefinite), { until } or a daily { startMin, endMin, tz }.
+      const rules = new Map();
+      for (const [cmd, rule] of Object.entries(user.disabled ?? {})) {
+        if (rule === true || rule?.until || rule?.startMin != null || rule?.auto) {
+          rules.set(cmd, rule);
+        }
+      }
+      if (rules.size) mutedCommands.set(user.userId, rules);
+
+      // Timezone, so windows mean the same thing after a restart.
+      if (user.tz !== undefined && user.tz !== null) userTz.set(user.userId, user.tz);
+
     }
 
     console.log(`[startup] Restored ${restored} cooldown(s) for ${users.length} user(s).`);
-    console.log(`[startup] Loaded ${quiet.loadAll(users)} quiet-hour window(s).`);
+    console.log(`[startup] Loaded ${quiet.loadAll(users)} quiet-hour window(s), ` +
+      `${userTz.size} custom timezone(s).`);
 
     // Daily digest at each reset, delivered to the channel the user plays in.
     digest.scheduleDaily(
@@ -903,6 +1283,35 @@ const restoreCooldownsFromDB = async (client) => {
       },
       (userId) => isMuted(userId, 'digest')
     );
+
+    // Invasion announcements go only to people who have played in the last day.
+    // Read fresh at fire time, not from this startup snapshot, so someone who
+    // stopped playing weeks ago drops off by themselves.
+    const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
+    const activePlayers = async () => {
+      const cutoff = new Date(Date.now() - ACTIVE_WINDOW_MS);
+      const rows = await database.collection
+        .find({ lastSeen: { $gte: cutoff } }).toArray();
+      return rows
+        .map(u => ({
+          userId: u.userId,
+          channelId: Object.values(u.cooldowns ?? {}).map(c => c?.channelId).find(Boolean) ?? null,
+        }))
+        .filter(u => u.channelId);
+    };
+
+    console.log(`[startup] ${await invasion.loadToday()} invasion sign(s) already recorded today.`);
+    invasion.scheduleWindows(
+      activePlayers,
+      async (channelId) => {
+        try { return await client.channels.fetch(channelId); }
+        catch { return null; }
+      },
+      isMuted,
+      (userId) => quiet.isQuiet(userId)
+    );
+
+    console.log(`[startup] Report answers enabled in ${await loadReportChannels()} channel(s).`);
 
     await dailies.restoreNudges(
       async (channelId) => {
@@ -939,6 +1348,47 @@ module.exports = {
   // Wrapped, not passed directly: handleBotMessage is a `const` declared below
   // this object, so referencing it here would hit the temporal dead zone.
   handleBotMessage: (...args) => handleBotMessage(...args),
+  handleComponent: (...args) => handleComponent(...args),
+};
+
+/**
+ * Message-component interactions. Only the timezone picker for now.
+ *
+ * The customId carries the id of whoever ran `nh tz`, so someone else clicking
+ * the same dropdown cannot change their setting — the menu sits in a shared
+ * channel and Discord will happily deliver anyone's click.
+ */
+const handleComponent = async (interaction) => {
+  if (!interaction.isStringSelectMenu?.()) return false;
+  const [kind, ownerId] = String(interaction.customId).split(':');
+  if (kind !== 'tz') return false;
+
+  if (interaction.user.id !== ownerId) {
+    await interaction.reply({
+      content: 'That picker belongs to someone else — run `nh tz` to get your own.',
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  const zone = interaction.values?.[0];
+  const tz = quiet.parseTimezone(zone);
+  if (tz === null) {
+    await interaction.reply({ content: `Couldn't read **${zone}**.`, ephemeral: true });
+    return true;
+  }
+
+  const cfg = await applyTimezone(ownerId, tz);
+  await interaction.update({
+    content:
+      `<@${ownerId}> 🕒 timezone set to **${quiet.describeTz(tz)}**` +
+      ` — it is **${quiet.clockIn(zone)}** there now.` +
+      (cfg ? `\n-# quiet hours re-read in it: **${quiet.describe(ownerId)}**` : '') +
+      `\n-# every window you set — \`nh quiet\`, \`nh pause <cmd> 16:00-05:30\` — now uses this.`,
+    components: [],
+  });
+  console.log(`[tz] ${ownerId} set ${zone} via picker`);
+  return true;
 };
 
 // ─── Bot message router ───────────────────────────────────────────────────────
@@ -953,6 +1403,24 @@ const handleBotMessage = async (message, client) => {
   const owner  = extractOwner(text);
   const ownerId = owner ? resolveUserId(client, owner) : null;
 
+  // ── Invasion sign confirmed ───────────────────────────────────────────────
+  // Names the player itself ("...were signed for invasion defense **eiota**!"),
+  // so it does not depend on extractOwner, which keys off the "X's page" form
+  // this message does not use.
+  const signed = invasion.parseSign(text);
+  if (signed) {
+    const user = findUserByUsername(client, signed.username);
+    if (user) {
+      const { username, ...info } = signed;
+      await invasion.recordSign(user.id, info);
+      console.log(`[invasion] ${signed.username} signed — ` +
+        `${signed.power?.toLocaleString?.()} power, ${signed.resignsLeft ?? '?'} re-signs left`);
+    } else {
+      trace('invasion sign, unknown user', { username: signed.username });
+    }
+    return;   // nothing else parses this message
+  }
+
   // ── Report riddle: remember the info, answer when the options appear ──────
   if (reports.P.stageInfo.test(text)) {
     const info = reports.parseInfo(text);
@@ -966,9 +1434,12 @@ const handleBotMessage = async (message, client) => {
     const riddle = reportRiddles.get(message.id);
     if (riddle && !riddle.answered && !isMuted(ownerId, 'answers')) {
       riddle.answered = true;
-      const options = reports.parseOptions(text);
+      // Naming the button is only allowed in channels explicitly whitelisted for
+      // it; everywhere else this just repeats the detail you were shown.
+      const showOption = mayShowReportOption(message.channel.id);
+      const options = showOption ? reports.parseOptions(text) : [];
       // Plain name, not a mention — this fires while you're watching the timer.
-      const line = ownerId ? reports.format(owner, riddle.info, options) : null;
+      const line = ownerId ? reports.format(owner, riddle.info, options, { showOption }) : null;
       if (line) {
         await safeSend(message.channel, line);
         trace('report answered', { user: owner, options: options.length });
@@ -1099,8 +1570,20 @@ const handleBotMessage = async (message, client) => {
 
 // ─── User message router ──────────────────────────────────────────────────────
 
+// Light per-person throttle on `nh` commands. Several of them run a handful of
+// database queries, and with the bot open to everyone one person holding down
+// enter shouldn't be able to slow it for the rest. Game commands are untouched.
+const NH_THROTTLE_MS = 2000;
+const lastNhAt = new Map();
+
 const handleUserMessage = async (message, client) => {
   rememberUser(message.author); // so the game bot's "eiota's …" resolves to an id
+
+  if (/^nh\s/i.test(message.content)) {
+    const last = lastNhAt.get(message.author.id) ?? 0;
+    if (Date.now() - last < NH_THROTTLE_MS) return;   // silently ignore the burst
+    lastNhAt.set(message.author.id, Date.now());
+  }
 
   // ── nh <command> dispatcher ───────────────────────────────────────────────
   if (message.content.startsWith('nh ')) {
@@ -1177,6 +1660,61 @@ const handleUserMessage = async (message, client) => {
     return;
   }
 
+  // ── nh tz [zone] — what "23:00" means for you ────────────────────────────
+  const tzMatch = lower.match(/^nh\s+(?:tz|timezone)(?:\s+(.+))?$/);
+  if (tzMatch) {
+    const raw = tzMatch[1]?.trim();
+
+    if (!raw) {
+      const set = userTz.has(userId);
+      try {
+        await message.channel.send({
+          content:
+            `<@${userId}> 🕒 your timezone: **${quiet.describeTz(tzFor(userId))}**` +
+            `${set ? '' : ' — the default, not your own'}\n` +
+            `-# Pick below, or type \`nh tz Europe/Berlin\` / \`nh tz +02:00\`. ` +
+            `\`nh tz off\` restores the default.`,
+          components: [buildTzPicker(userId)],
+        });
+      } catch (err) {
+        // Components can fail on missing permissions; the typed form still works.
+        console.warn(`[tz] picker failed for ${userId}: ${err.message}`);
+        await safeSend(message.channel,
+          `<@${userId}> 🕒 your timezone: **${quiet.describeTz(tzFor(userId))}**\n` +
+          `-# set it with \`nh tz Europe/Berlin\` or \`nh tz +02:00\``);
+      }
+      return;
+    }
+
+    if (raw === 'off' || raw === 'clear' || raw === 'reset') {
+      userTz.delete(userId);
+      await persistTz(userId, null);
+      await safeSend(message.channel,
+        `<@${userId}> timezone cleared — back to the ${quiet.describeTz(quiet.DEFAULT_TZ_MINUTES)} default.`);
+      return;
+    }
+
+    // Case matters for IANA names, so parse the original text, not `lower`.
+    const original = message.content.trim().replace(/^nh\s+(?:tz|timezone)\s+/i, '');
+    const tz = quiet.parseTimezone(original);
+    if (tz === null) {
+      await safeSend(message.channel,
+        `<@${userId}> couldn't read **${original}**. Try a zone name like ` +
+        `\`Europe/Berlin\`, \`America/New_York\`, \`Asia/Kolkata\` — or an offset like \`+02:00\`.`);
+      return;
+    }
+
+    const cfg = await applyTimezone(userId, tz);
+
+    await safeSend(message.channel,
+      `<@${userId}> 🕒 timezone set to **${quiet.describeTz(tz)}**.` +
+      (cfg ? `\n-# quiet hours re-read in it: **${quiet.describe(userId)}**` : '') +
+      (typeof tz === 'number'
+        ? `\n-# a fixed offset will not follow daylight saving — a zone name like \`Europe/Berlin\` does`
+        : ''));
+    return;
+  }
+
   // ── nh quiet [HH:MM-HH:MM | off] — hold pings overnight ──────────────────
   const quietMatch = lower.match(/^nh\s+quiet(?:\s+(.+))?$/);
   if (quietMatch) {
@@ -1189,7 +1727,8 @@ const handleUserMessage = async (message, client) => {
           (quiet.pendingCount(userId) ? ` · ${quiet.pendingCount(userId)} reminder(s) held` : '') +
           `\n-# \`nh quiet off\` to clear`
         : `<@${userId}> no quiet hours set. Try \`nh quiet 23:00-08:00\` ` +
-          `— times are IST unless you add an offset like \`+00:00\`.`);
+          `— read in **${quiet.describeTz(tzFor(userId))}**` +
+          `${userTz.has(userId) ? '' : ', the default'}. \`nh tz\` to change that.`);
       return;
     }
 
@@ -1200,7 +1739,7 @@ const handleUserMessage = async (message, client) => {
       return;
     }
 
-    const cfg = quiet.parseWindow(arg);
+    const cfg = quiet.parseWindow(arg, tzFor(userId));
     if (!cfg) {
       await safeSend(message.channel,
         `<@${userId}> couldn't read that. Use \`nh quiet 23:00-08:00\` ` +
@@ -1211,7 +1750,8 @@ const handleUserMessage = async (message, client) => {
     await persistQuiet(userId, cfg);
     await safeSend(message.channel,
       `<@${userId}> 🌙 quiet hours set to **${quiet.describe(userId)}**. ` +
-      `Reminders in that window are held and delivered together when it ends.`);
+      `Reminders in that window are held and delivered together when it ends.` +
+      `${userTz.has(userId) ? '' : `\n-# read in ${quiet.describeTz(quiet.DEFAULT_TZ_MINUTES)} — \`nh tz\` if that is not yours`}`);
     return;
   }
 
@@ -1234,6 +1774,35 @@ const handleUserMessage = async (message, client) => {
     const days = Math.min(30, Math.max(1, parseInt(missionsMatch[1] ?? '7', 10)));
     await safeSend(message.channel, await xptracker.missionReport(userId, days).catch(() =>
       `<@${userId}> couldn't read mission data right now.`));
+    return;
+  }
+
+  // ── nh util [24h|week] — how much of each cooldown you actually used ─────
+  const utilMatch = lower.match(/^nh\s+(?:util|utilisation|utilization|usage)(?:\s+(\w+))?$/);
+  if (utilMatch) {
+    const windows = {
+      today: [null, "since today's reset"],
+      '24h': [86_400_000, 'last 24h'],
+      day:   [86_400_000, 'last 24h'],
+      week:  [7 * 86_400_000, 'last 7 days'],
+      '7d':  [7 * 86_400_000, 'last 7 days'],
+    };
+    const [sinceMs, label] = windows[utilMatch[1]] ?? windows.today;
+
+    // Only the fast, repeatable commands say anything useful about uptime — a
+    // weekly cooldown at 0/1 tells you nothing about whether the bot was up.
+    const tracked = {
+      mission:   COOLDOWN_DURATIONS.mission,
+      report:    COOLDOWN_DURATIONS.report,
+      challenge: COOLDOWN_DURATIONS.challenge,
+      train:     COOLDOWN_DURATIONS.train,
+    };
+
+    await safeSend(message.channel,
+      await xptracker.utilisationReport(userId, tracked, sinceMs, label).catch((err) => {
+        console.error('[util] report failed:', err.message);
+        return `<@${userId}> couldn't read utilisation data right now.`;
+      }));
     return;
   }
 
@@ -1270,21 +1839,24 @@ const handleUserMessage = async (message, client) => {
   const muteMatch = lower.match(/^nh\s+(on|off)\s+(\w+)$/);
   if (muteMatch) {
     const [, verb, raw] = muteMatch;
-    // "report" is the 10-minute reminder; "answers" is the report *helper*.
-    // Keep them distinct so muting one can't silently kill the other.
-    const MUTE_ALIASES = { reporthelper: 'answers', answer: 'answers', helper: 'answers' };
     const target = MUTE_ALIASES[raw] ?? raw;
 
-    const known = new Set([
-      ...Object.keys(COOLDOWN_DURATIONS), 'daily', 'dailies', 'digest', 'answers', 'jutsu', 'all',
-    ]);
-    if (!known.has(target)) {
+    if (!MUTABLE.has(target)) {
       await safeSend(message.channel,
-        `<@${userId}> unknown reminder **${raw}**. Options: ${[...known].join(', ')}`);
+        `<@${userId}> unknown reminder **${raw}**. Options: ${[...MUTABLE].join(', ')}`);
       return;
     }
 
-    await setMuted(userId, target, verb === 'off');
+    await setMuted(userId, target, verb === 'off' ? true : null);
+    if (verb === 'on') {
+      // Asking for it back is the clearest signal there is — start them level,
+      // or the bot is already two strikes into resting it again.
+      if (target === 'all') {
+        for (const k of [...ignoredStreak.keys()]) {
+          if (k.startsWith(`${userId}:`)) ignoredStreak.delete(k);
+        }
+      } else ignoredStreak.delete(ckey(userId, target));
+    }
     const what = target === 'answers' ? 'report answer helper'
                : target === 'digest'  ? 'daily digest'
                : `**${target}** reminders`;
@@ -1297,10 +1869,13 @@ const handleUserMessage = async (message, client) => {
 
   // ── nh mutes — what's currently silenced ─────────────────────────────────
   if (/^nh\s+(mutes|toggles)$/.test(lower)) {
-    const set = mutedCommands.get(userId);
+    const rules = mutedCommands.get(userId);
+    const live = [...(rules ?? [])].filter(([, r]) => ruleActive(r) || r === true || r?.startMin != null);
     await safeSend(message.channel,
-      set?.size
-        ? `<@${userId}> muted: ${[...set].map(c => `**${c}**`).join(', ')}`
+      live.length
+        ? `<@${userId}> **silenced:**\n` + live
+            .map(([c, r]) => `> **${c}** — ${describeRule(r)}${ruleActive(r) ? '' : ' -# (not right now)'}`)
+            .join('\n')
         : `<@${userId}> nothing muted — all reminders are on.`);
     return;
   }
@@ -1314,6 +1889,66 @@ const handleUserMessage = async (message, client) => {
       console.error('[xp] report failed:', err);
       await safeSend(message.channel, `<@${userId}> couldn't read XP data right now.`);
     }
+    return;
+  }
+
+  // ── nh whitelist [here|<id>|remove <id>] — report-answer channels ─────────
+  const wlMatch = message.content.trim().match(/^nh\s+(?:whitelist|wl)\b\s*(.*)$/i);
+  if (wlMatch) {
+    const arg = wlMatch[1].trim();
+
+    // Listing is harmless; changing it is not.
+    if (!arg || arg === 'list') {
+      const ids = [...reportChannels];
+      await safeSend(message.channel,
+        ids.length
+          ? `<@${userId}> 📝 report answers are enabled in:\n` +
+            ids.map(id => `> <#${id}> \`${id}\``).join('\n') +
+            `\n-# everywhere else only repeats the detail, never the option`
+          : `<@${userId}> report answers are **off everywhere** — the helper repeats ` +
+            `the detail you were shown but never names the option.\n` +
+            `-# \`nh whitelist here\` to allow it in this channel`);
+      return;
+    }
+
+    if (!canManageChannels(message)) {
+      await safeSend(message.channel,
+        `<@${userId}> only a server admin can change this.`);
+      return;
+    }
+
+    const removing = /^(remove|rm|off|delete)\b/i.test(arg);
+    const raw = removing ? arg.replace(/^\w+\s*/, '').trim() : arg;
+    const target = (!raw || raw === 'here') ? message.channel.id : raw.replace(/[<#>]/g, '');
+
+    if (!/^\d{17,20}$/.test(target)) {
+      await safeSend(message.channel,
+        `<@${userId}> that doesn't look like a channel id. Use \`nh whitelist here\` ` +
+        `or \`nh whitelist <channel id>\`.`);
+      return;
+    }
+
+    if (removing) {
+      if (!reportChannels.delete(target)) {
+        await safeSend(message.channel, `<@${userId}> <#${target}> wasn't whitelisted.`);
+        return;
+      }
+      await saveReportChannels();
+      await safeSend(message.channel,
+        `<@${userId}> 🔒 report answers disabled in <#${target}> — back to detail only.`);
+      return;
+    }
+
+    if (reportChannels.has(target)) {
+      await safeSend(message.channel, `<@${userId}> <#${target}> is already whitelisted.`);
+      return;
+    }
+    reportChannels.add(target);
+    await saveReportChannels();
+    await safeSend(message.channel,
+      `<@${userId}> ✅ report answers enabled in <#${target}>.\n` +
+      `-# the helper will now name the option to click there · ` +
+      `\`nh whitelist remove ${target}\` to undo`);
     return;
   }
 
@@ -1347,6 +1982,50 @@ const handleUserMessage = async (message, client) => {
     return;
   }
 
+  // ── nh pause <cmd> <2h | 16:00-05:30> — silence ONE reminder ─────────────
+  // Checked before the all-commands form below, which only matches a bare
+  // duration and so can never swallow this.
+  const pauseOne = message.content.trim().match(
+    /^nh\s+pause\s+([a-z_0-9]+)\s+(.+)$/i);
+  if (pauseOne) {
+    const target = MUTE_ALIASES[pauseOne[1].toLowerCase()] ?? pauseOne[1].toLowerCase();
+    const spec   = pauseOne[2].trim();
+
+    if (!MUTABLE.has(target)) {
+      await safeSend(message.channel,
+        `<@${userId}> unknown reminder **${pauseOne[1]}**. Options: ${[...MUTABLE].join(', ')}`);
+      return;
+    }
+
+    // A clock window ("16:00-05:30") repeats daily; a duration ("2h") expires once.
+    const window = quiet.parseWindow(spec, tzFor(userId));
+    if (window) {
+      await setMuted(userId, target, window);
+      await safeSend(message.channel,
+        `<@${userId}> 🔕 **${target}** reminders silenced daily between ` +
+        `**${quiet.describeWindow(window)}**.\n` +
+        `-# repeats every day · \`nh on ${target}\` to clear`);
+      return;
+    }
+
+    const dur = spec.match(/^(\d+)\s*(h|m|hr|hrs|hour|hours|min|mins|minute|minutes)$/i);
+    if (dur) {
+      const n = parseInt(dur[1], 10);
+      const seconds = /^m/i.test(dur[2]) ? n * 60 : n * 3600;
+      const until = Math.floor(Date.now() / 1000) + seconds;
+      await setMuted(userId, target, { until });
+      await safeSend(message.channel,
+        `<@${userId}> 🔕 **${target}** reminders off until <t:${until}:t> ` +
+        `(<t:${until}:R>).\n-# \`nh on ${target}\` to bring them back sooner`);
+      return;
+    }
+
+    await safeSend(message.channel,
+      `<@${userId}> couldn't read "${spec}". Try \`nh pause ${target} 2h\` ` +
+      `or \`nh pause ${target} 16:00-05:30\`.`);
+    return;
+  }
+
   // ── nh pause <Xh|Xm> ─────────────────────────────────────────────────────
   const pauseMatch = lower.match(/^nh\s+pause\s+(\d+)(h|m)$/);
   if (pauseMatch) {
@@ -1367,9 +2046,13 @@ const handleUserMessage = async (message, client) => {
   }
 
   // ── n cd — suppress the upcoming burst from the cooldown embed ───────────
-  if (lower === 'n cd') {
-    cdCheckSuppressed.add(userId);
-    setTimeout(() => cdCheckSuppressed.delete(userId), 5000).unref();
+  // Keyed on the channel, not the person who typed it. `n cd @someone` returns
+  // *their* page, so keying on the typer left the suppression looking for one id
+  // while the embed handler checked another — and the confirmation went out,
+  // pinging someone who had not asked for anything.
+  if (/^n\s+cd\b/.test(lower)) {
+    cdCheckSuppressed.add(message.channel.id);
+    setTimeout(() => cdCheckSuppressed.delete(message.channel.id), 5000).unref();
     return;
   }
 
@@ -1415,9 +2098,14 @@ const processCooldownEmbed = async (message, client) => {
     return;
   }
 
-  // Check if this was triggered by "n cd" — if so, save cooldowns silently
-  const isSilent = cdCheckSuppressed.has(user.id);
-  if (isSilent) cdCheckSuppressed.delete(user.id);
+  // The game bot edits this page in place, and edits route back through here so
+  // the numbers stay fresh. Saving twice is harmless — announcing twice is not.
+  const announced = cdAnnounced.has(message.id);
+  cdAnnounced.set(message.id, Date.now());
+
+  // Triggered by someone typing `n cd` in this channel? Then they are looking
+  // straight at the page and a confirmation adds nothing.
+  const isSilent = announced || cdCheckSuppressed.has(message.channel.id);
 
   let anyUpdated = false;
   for (const field of embed.fields) {
@@ -1510,7 +2198,7 @@ const processTowerMessage = async (message, client) => {
   if (!match) return;
   const user = findUserByUsername(client, match[1]);
   if (!user) return;
-  const updated = await saveCooldown(user.id, "tower", COOLDOWN_DURATIONS.tower, message.channel, client);
+  const updated = await saveCooldown(user.id, "tower", COOLDOWN_DURATIONS.tower, message.channel, client, { ranNow: true });
   if (updated) await safeSend(message.channel, `6h tower reminder set.`);
 };
 
@@ -1528,7 +2216,7 @@ const processSparringMessage = async (message, client) => {
   if (message.content.includes('defeated')) {
     const last = recentChallenges.get(message.channel.id);
     if (last && Date.now() - last.timestamp < PENDING_TTL_MS) {
-      const updated = await saveCooldown(last.challengerId, "challenge", COOLDOWN_DURATIONS.challenge, message.channel, client);
+      const updated = await saveCooldown(last.challengerId, "challenge", COOLDOWN_DURATIONS.challenge, message.channel, client, { ranNow: true });
       // no ping — just a quiet confirmation
       if (updated) await safeSend(message.channel, `✅ Challenge reminder set.`);
       recentChallenges.delete(message.channel.id);
@@ -1559,7 +2247,7 @@ const processVoteShopPurchase = async (message, client) => {
 
   const updated = await saveCooldown(
     user.id, key, useStated ? stated : duration, message.channel, client,
-    { authority: useStated ? AUTHORITY.stated : AUTHORITY.table }
+    { authority: useStated ? AUTHORITY.stated : AUTHORITY.table, ranNow: true }
   );
 
   if (updated) {

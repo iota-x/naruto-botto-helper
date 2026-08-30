@@ -1,4 +1,5 @@
 const { Message, EmbedBuilder } = require("discord.js");
+const { GAME_BOT_ID } = require("../config");
 
 /**
  * Handles balance reaction and replies with calculated pulls.
@@ -7,7 +8,7 @@ const { Message, EmbedBuilder } = require("discord.js");
 async function handleBalanceReaction(message) {
   try {
     if (!message.author.bot) return;
-    if (message.author.id !== "770100332998295572") return;
+    if (message.author.id !== GAME_BOT_ID) return;   // only the game bot
     if (!message.embeds[0] || !message.embeds[0].title) return;
 
     const title = message.embeds[0].title;

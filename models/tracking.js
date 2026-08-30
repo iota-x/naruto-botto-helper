@@ -63,10 +63,34 @@ const DailyResultSchema = new mongoose.Schema({
 });
 DailyResultSchema.index({ userId: 1, day: -1 }, { unique: true });
 
+// One row per user per day they signed for invasion. Re-signing refreshes the
+// power rather than adding a second defence, so the row is upserted on
+// (userId, day) and the latest power wins — which is also the one that counts.
+const InvasionSignSchema = new mongoose.Schema({
+  userId:      { type: String, required: true },
+  day:         { type: String, required: true },   // YYYY-MM-DD, UTC
+  ninjas:      { type: Number, default: null },
+  power:       { type: Number, default: null },
+  boost:       { type: Number, default: null },    // percent, null when none
+  resignsLeft: { type: Number, default: null },
+  at:          { type: Date,   default: Date.now, expires: '90d' },
+});
+InvasionSignSchema.index({ userId: 1, day: -1 }, { unique: true });
+
+// Small key/value store for settings that must outlive a restart and be
+// changeable from Discord rather than by editing .env and redeploying.
+const SettingSchema = new mongoose.Schema({
+  key:   { type: String, required: true, unique: true },
+  value: { type: mongoose.Schema.Types.Mixed },
+  at:    { type: Date, default: Date.now },
+});
+
 module.exports = {
+  Setting:     mongoose.model('setting', SettingSchema, 'settings'),
   DailyResult: mongoose.model('dailyresult', DailyResultSchema, 'dailyresults'),
   Dailies:     mongoose.model('dailies', DailiesSchema, 'dailies'),
   Balance:     mongoose.model('balance', BalanceSchema, 'balances'),
   FeedRoutine: mongoose.model('feedroutine', FeedRoutineSchema, 'feedroutines'),
   FeedLog:     mongoose.model('feedlog', FeedLogSchema, 'feedlogs'),
+  InvasionSign: mongoose.model('invasionsign', InvasionSignSchema, 'invasionsigns'),
 };

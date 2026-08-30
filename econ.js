@@ -63,6 +63,10 @@ const since = async (userId, from) => {
   return { earned, spent, net: earned - spent, bySource, count: rows.length };
 };
 
+/** Total xp across every source in a `since()` result. */
+const dayXpOf = (bucket) =>
+  Object.values(bucket.bySource).reduce((a, s) => a + (s.xp || 0), 0);
+
 const report = async (userId) => {
   const [today, day, latest] = await Promise.all([
     since(userId, lastDailyReset()),
@@ -77,11 +81,25 @@ const report = async (userId) => {
   const sign = (n) => `${n >= 0 ? '+' : '−'}${fmt(Math.abs(n))}`;
   const lines = [`<@${userId}> **economy**`];
 
-  lines.push(
-    `📅 Since reset: **${sign(today.net)} ryo** ` +
-    `(earned ${fmt(today.earned)}, spent ${fmt(today.spent)})`
-  );
-  if (day.count) lines.push(`🕐 Last 24h: **${sign(day.net)} ryo** over ${day.count} action(s)`);
+  // Earned and spent are the numbers people actually want, so they get their own
+  // line rather than a parenthetical after the net.
+  const todayXp = dayXpOf(today);
+  const resetAt = Math.floor(lastDailyReset().getTime() / 1000);
+
+  lines.push(`📅 **Today** — since the reset <t:${resetAt}:R>`);
+  lines.push(`> earned **+${fmt(today.earned)}** ryo · spent **−${fmt(today.spent)}** ryo`);
+  lines.push(`> net **${sign(today.net)} ryo**${todayXp ? ` · gained **+${fmt(todayXp)} xp**` : ''}`);
+
+  // Deliberately labelled as rolling: it is a 24-hour window ending now, so it
+  // overlaps yesterday and will not agree with the figures above. Two people
+  // have now read it as "today", which is worth one extra word to prevent.
+  if (day.count) {
+    lines.push(
+      `🕐 **Rolling 24h** — ${sign(day.net)} ryo over ${fmt(day.count)} action(s)` +
+      (dayXpOf(day) ? ` · ${sign(dayXpOf(day))} xp` : '')
+    );
+    lines.push('-# a moving window ending now, so it reaches back into yesterday');
+  }
 
   const sources = Object.entries(today.bySource).sort(([, a], [, b]) => b.n - a.n);
   if (sources.length) {

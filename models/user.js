@@ -24,6 +24,19 @@ const UserSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: {},
   },
+  // Quiet-hours window: { startMin, endMin, tz }. Mixed because `tz` holds
+  // either a minutes offset or an IANA zone name.
+  quiet: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
+  // The account's own timezone — a minutes offset (330) or a zone name
+  // ("Europe/Berlin"). Null means the IST default. Every wall-clock window the
+  // helper reads is anchored to this, so it is not safe to leave undeclared.
+  tz: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
 });
 
 module.exports = mongoose.model("user", UserSchema, "user");

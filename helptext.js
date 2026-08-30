@@ -27,6 +27,11 @@ const OVERVIEW = {
     'arm a reminder.\n\nUse **`nh help <topic>`** for detail on any group below.',
   fields: [
     {
+      name: '👋 New? — `nh help start`',
+      value: 'What this does, what to run first, and how to make it quieter.\n' +
+             'Nothing needs setting up — reminders begin on their own.',
+    },
+    {
       name: '🧭 Right now — `nh next`',
       value: 'One view: what is off cooldown, feeds due today with the exact commands,\n' +
              'what lands soonest, and dailies still open.',
@@ -37,13 +42,15 @@ const OVERVIEW = {
         '`nh status` — every active cooldown, soonest first\n' +
         '`nh pause <Xh|Xm>` · `nh resume` — silence everything for a while\n' +
         '`nh off <cmd>` · `nh on <cmd>` · `nh mutes` — silence one reminder\n' +
-        '`nh quiet 23:00-08:00` — hold overnight pings, deliver them together',
+        '`nh quiet 23:00-08:00` — hold overnight pings, deliver them together\n' +
+        '`nh tz` — pick your timezone from a list so those windows mean what you expect',
     },
     {
       name: '💎 Pass, stats & streaks',
       value:
         '`nh pass` — Monthly Pass level and the pace needed to finish it\n' +
         '`nh missions [days]` — mission counts and ryo by rank\n' +
+        '`nh util [24h|week]` — runs taken vs runs the cooldowns allowed\n' +
         '`nh streak` — consecutive days with every daily cleared\n' +
         '`nh digest` — yesterday\'s XP, ryo, dailies and feeds (also posts at reset)',
     },
@@ -52,6 +59,12 @@ const OVERVIEW = {
       value:
         'When `n jutsu` asks to confirm, I check the cost against your last `n bal`\n' +
         'and say whether you can afford it. `nh off jutsu` turns it off.',
+    },
+    {
+      name: '⚔️ Invasion — `nh help invasion`',
+      value:
+        'Two sign-up windows a day (09:00 and 21:00 UTC). I ping you when one opens\n' +
+        'and again before it shuts, and stop the moment I see you sign.',
     },
     {
       name: '🍜 Feed routine — `nh help feed`',
@@ -63,8 +76,8 @@ const OVERVIEW = {
     {
       name: '📝 Report helper — `nh help reports`',
       value:
-        'When `n r` asks you to pick the info back out of three options, I read the\n' +
-        'earlier info page and tell you which one matches. Automatic, no command.',
+        'When `n r` asks you to pick the info back out of three options, I repeat the\n' +
+        'detail you were shown — you still choose. Automatic, no command.',
     },
     {
       name: '📈 XP & levelling — `nh help xp`',
@@ -98,6 +111,77 @@ const OVERVIEW = {
 };
 
 const TOPICS = {
+  start: {
+    title: '👋 Getting started',
+    description:
+      'I watch Naruto Botto in this channel and keep track of your cooldowns, XP, ' +
+      'dailies and feeds. I never play for you — I only read what the game already ' +
+      'showed you, and tell you when something is ready.\n\n' +
+      'You do not have to set anything up. Play as normal and reminders begin on ' +
+      'their own. Everything below is optional.',
+    fields: [
+      {
+        name: '1 · Just play',
+        value:
+          'Run `n m`, `n r`, `n tr` and so on as usual. When the game confirms a ' +
+          'command worked, I start a timer and ping you the moment it is ready again.\n' +
+          '-# If the game refuses a command — maintenance, still on cooldown — I do ' +
+          'not set a reminder, so you never get a false ping.',
+      },
+      {
+        name: '2 · Run `n cd` once',
+        value:
+          'The cooldown page tells me every timer you already have, so I catch up ' +
+          'instantly instead of learning them one at a time.\n' +
+          '-# Worth doing again any time you think I have drifted — it always wins ' +
+          'over anything I guessed.',
+      },
+      {
+        name: '3 · Your one everyday command: `nh next`',
+        value:
+          'Shows what is off cooldown right now, feeds still due today with the exact ' +
+          'commands to send, what lands soonest, and which dailies are open.\n' +
+          '-# If you only ever remember one thing, remember this one.',
+      },
+      {
+        name: '4 · Stop the overnight pings',
+        value:
+          'Dailies reset at 00:00 UTC, which is the middle of the night in a lot of ' +
+          'places.\n' +
+          '`nh quiet 23:00-08:00` holds pings during those hours and delivers them ' +
+          'in one summary when you wake up — nothing is lost.\n' +
+          '-# Those times are read in IST by default. Not where you are? Run ' +
+          '`nh tz` once and pick the row showing your current time.',
+      },
+      {
+        name: '5 · If you feed ninjas daily',
+        value:
+          'Save the routine once and I will tick it off as you go:\n' +
+          '```\nnh feed set\n223 rl\n265 rl\n152 rm\n```\n' +
+          'Then `nh feed` any time shows what is left and the next command to send.',
+      },
+      {
+        name: 'Want less noise?',
+        value:
+          '`nh off train` — never remind me about training\n' +
+          '`nh pause train 2h` — not for the next couple of hours\n' +
+          '`nh pause train 16:00-05:30` — not during these hours, every day\n' +
+          '`nh pause 2h` — nothing at all for a while · `nh resume` to undo',
+      },
+      {
+        name: 'Curious how you are doing?',
+        value:
+          '`nh xp` — gains today, xp/hr, and how long until each ninja levels\n' +
+          '`nh util` — how many runs you took vs how many were possible\n' +
+          '`nh ryo` · `nh missions` · `nh dailies` · `nh pass` · `nh streak`',
+      },
+      {
+        name: 'Everything else',
+        value: '`nh help` lists every command, grouped. `nh help <topic>` goes deeper.',
+      },
+    ],
+  },
+
   reminders: {
     title: '⏰ Reminders',
     description:
@@ -126,6 +210,8 @@ const TOPICS = {
         value:
           '`nh status` — active cooldowns + next dailies reset\n' +
           '`nh pause 2h` / `nh pause 30m` — mute everything temporarily\n' +
+          '`nh pause train 2h` — mute one reminder for a while\n' +
+          '`nh pause train 16:00-05:30` — mute one reminder daily in that window\n' +
           '`nh resume` — unpause early\n' +
           '`nh off mission` — mute one reminder permanently\n' +
           '`nh off all` — mute every reminder\n' +
@@ -133,13 +219,37 @@ const TOPICS = {
           '`nh mutes` (or `nh toggles`) — list what is currently silenced',
       },
       {
+        name: 'Reminders you ignore go quiet by themselves',
+        value:
+          'You do not have to mute anything to stop being pestered. If three\n' +
+          'reminders in a row for one command go unanswered, that reminder rests\n' +
+          'on its own and the last one tells you so.\n' +
+          '• play a command properly again and its reminder comes back by itself\n' +
+          '• `nh on <cmd>` brings it back right away\n' +
+          '• `nh mutes` shows anything resting this way\n' +
+          'Reminders you *do* act on are never touched — grind away.',
+      },
+      {
         name: 'Quiet hours',
         value:
-          'Dailies reset at 05:30 IST, so that reminder lands overnight. A quiet window ' +
-          '**holds** pings rather than dropping them and delivers one summary when it ends.\n' +
-          '`nh quiet 23:00-08:00` — set (times are IST by default)\n' +
-          '`nh quiet 23:00-08:00 +00:00` — set with a different timezone\n' +
-          '`nh quiet` — show the window · `nh quiet off` — clear it',
+          'Dailies reset at 00:00 UTC, so that reminder lands overnight for many people. ' +
+          'A quiet window **holds** pings rather than dropping them and delivers one ' +
+          'summary when it ends.\n' +
+          '`nh quiet 23:00-08:00` — set · `nh quiet` — show · `nh quiet off` — clear',
+      },
+      {
+        name: 'Your timezone',
+        value:
+          'Every window above is a wall-clock time, so it needs a timezone. The default ' +
+          'is IST because most of this server plays from India — if that is not you, ' +
+          'set your own once and every window follows it.\n' +
+          '**`nh tz`** — opens a picker; choose the row showing **your current time**, ' +
+          'no zone names to look up\n' +
+          '`nh tz Europe/Berlin` · `nh tz +02:00` — if you would rather type it\n' +
+          '`nh tz off` — back to the default\n' +
+          '-# A zone name follows daylight saving on its own; a fixed offset goes an ' +
+          'hour wrong at the changeover. Setting your timezone also re-reads any quiet ' +
+          'hours you already have, so the times you typed keep their meaning.',
       },
       {
         name: 'Good to know',
@@ -231,24 +341,35 @@ const TOPICS = {
     description:
       '`n r` shows you a fact for 7 seconds, then asks you to pick it out of three ' +
       'near-identical options within 13. Both halves are edits of the same message, so ' +
-      'I hold on to the info and tell you which option matches as soon as they appear.',
+      'I hold on to the detail and repeat it back when the options appear.\n\n' +
+      '**I do not tell you which button to press.** That would be answering for you, ' +
+      'which the game does not allow. You still read the options and choose.',
     fields: [
       {
-        name: 'How it reads',
+        name: 'What you see',
         value:
-          '`📝 report → :one:` — all three details matched, safe to pick\n' +
-          '`📝 report → probably :two: (2/3 match)` — best guess, check it yourself\n' +
-          '`📝 report → couldn\'t tell these apart` — two options scored the same',
+          '`📝 **you** report → **3 red, in the dango shop**`\n' +
+          'That is the detail from the info page, held for you through the 7-second ' +
+          'window so you are not relying on memory when the options appear.',
       },
       {
         name: 'Notes',
         value:
           '• Nothing to run — it fires on its own during `n r`\n' +
-          '• It matches on count, colour and place; all three must agree for a confident answer\n' +
           '• No mention, so it will not ping you mid-timer\n' +
           '• `nh off answers` turns it off · `nh on answers` back on\n' +
           '  (that is separate from `nh off report`, which mutes the 10-minute reminder)\n' +
-          '• It only reads what the game already showed you. It does not answer for you.',
+          '• It only repeats what the game already showed you, and never picks for you.',
+      },
+      {
+        name: 'Admins: allowing the full answer',
+        value:
+          'In a channel you explicitly allow, it can also name the option to click:\n' +
+          '`nh whitelist` — show which channels are allowed\n' +
+          '`nh whitelist here` — allow it in this channel\n' +
+          '`nh whitelist <channel id>` — allow it somewhere else\n' +
+          '`nh whitelist remove here` — back to detail only\n' +
+          '-# off everywhere by default · needs Manage Server or higher',
       },
     ],
   },
@@ -315,13 +436,17 @@ const TOPICS = {
     fields: [
       {
         name: 'Commands',
-        value: '`nh ryo` — earned/spent since reset and over 24h, broken down by source\n' +
+        value: '`nh ryo` — today: ryo earned, spent, net, and xp gained — plus a source breakdown\n' +
                'Aliases: `nh econ`, `nh economy`, `nh money`',
       },
       {
         name: 'What it tells you',
         value:
-          '• Net ryo since reset, and per-run averages by source\n' +
+          '• **Today** — ryo earned, ryo spent, net, and total xp gained since the ' +
+          '00:00 UTC reset\n' +
+          '• **Rolling 24h** — the same over a moving window ending now. It reaches ' +
+          'back into yesterday, so it will not match "Today" and is not meant to\n' +
+          '• Per-run averages by source (mission, report, train)\n' +
           '• **Training cost per 1,000 xp** — whether a tier is worth it\n' +
           '• What your balance affords: pulls at 300 ryo, special pulls at 500 tickets\n' +
           'Run `n bal` to refresh the balance.',
@@ -330,6 +455,49 @@ const TOPICS = {
         name: 'Pull calculator',
         value: 'React 🔢 on any `n bal` page and the bot replies with how many normal and ' +
                'special pulls you can afford right now.',
+      },
+    ],
+  },
+
+  invasion: {
+    title: '⚔️ Invasion',
+    body:
+      'The Ōtsutsuki clan invades every day. You sign your ninja list in defence during ' +
+      'one of two windows, and the invasion resolves after 22:00 UTC.',
+    fields: [
+      {
+        name: 'The two windows',
+        value:
+          '`09:00–09:45 UTC` — 14:30 IST\n' +
+          '`21:00–21:45 UTC` — 02:30 IST\n' +
+          'Both feed the **same** invasion — two chances to sign, not two rewards.',
+      },
+      {
+        name: 'Signing',
+        value:
+          '`n invasion sign` (or `n i s`) — signs with your current `n list` power\n' +
+          'You may sign up to three times, but a re-sign only **refreshes** your power — ' +
+          'it does not stack. One sign is enough.\n' +
+          '-# Power is read at the moment you sign, so a later sign-up reflects a ' +
+          'fuller day of training.',
+      },
+      {
+        name: 'What the helper does',
+        value:
+          '• pings you when a window opens, and once more ~10 min before it shuts\n' +
+          '• both reminders stop for the day the moment it sees you sign\n' +
+          '• `nh next` shows whether you are signed, and the power you signed with\n' +
+          '• `nh off invasion` silences it · `nh on invasion` brings it back\n' +
+          '-# The 02:30 IST window is skipped rather than held if it falls inside your ' +
+          'quiet hours — a ping delivered after the window shut would be no use.',
+      },
+      {
+        name: 'Rewards',
+        value:
+          'Ryo scales with your total list power, from 1500 (≤1mil) to 6500 (3mil+). ' +
+          'Five MVPs also receive a **Chakra Fruit**, and the higher your list power the ' +
+          'better your chance. Weekly missions and players challenged both add bonus ' +
+          'power on top — see `n invasion` in-game for the table.',
       },
     ],
   },
@@ -366,8 +534,13 @@ const TOPICS = {
 };
 
 const ALIASES = {
+  getstarted: 'start', 'get-started': 'start', begin: 'start', intro: 'start',
+  tutorial: 'start', guide: 'start', setup: 'start', new: 'start', first: 'start',
+  basics: 'start', how: 'start',
   reminder: 'reminders', remind: 'reminders', cooldowns: 'reminders', cd: 'reminders',
   status: 'reminders', pause: 'reminders', mute: 'reminders', mutes: 'reminders',
+  tz: 'reminders', timezone: 'reminders', quiet: 'reminders',
+  sign: 'invasion', i: 'invasion',
   ramen: 'feed', feeding: 'feed',
   level: 'xp', levels: 'xp', exp: 'xp', eta: 'xp', track: 'xp',
   daily: 'dailies', d: 'dailies',

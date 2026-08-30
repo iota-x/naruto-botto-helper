@@ -81,11 +81,25 @@ const describe = (o) => `${o.count} ${o.colour}, ${o.place}`;
  * `label` is plain text, never a mention: you are already watching the screen
  * during the 13-second answer window, so a ping would be pure noise. The name
  * still says whose report it is when several people are playing in one channel.
+ *
+ * Two modes, and the difference matters:
+ *
+ *   default        repeat the detail you were just shown, and stop. You still
+ *                  have to read the options and decide. This is a memory aid.
+ *   showOption     also name the button to press. That is answering for you,
+ *                  which the game's rules do not allow, so it is opt-in per
+ *                  channel and off everywhere else.
  */
-const format = (label, info, options) => {
+const format = (label, info, options, opts = {}) => {
+  const who = label ? `**${label}** ` : '';
+
+  if (!opts.showOption) {
+    // Nothing about the options is used or revealed here — just the fact.
+    return info ? `📝 ${who}report → **${describe(info)}**` : null;
+  }
+
   const result = solve(info, options);
   if (!result) return null;
-  const who = label ? `**${label}** ` : '';
 
   if (result.exact) {
     return `📝 ${who}report → **:${result.best.emoji}:**  -# ${describe(result.best)}`;

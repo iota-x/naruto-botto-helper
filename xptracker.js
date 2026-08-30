@@ -307,10 +307,89 @@ const missionReport = async (userId, days = 7) => {
   return lines.join('\n');
 };
 
+/**
+ * How much of each cooldown you actually used.
+ *
+ * Every command is a metronome: a 60s cooldown allows 60 runs an hour, and any
+ * you don't take are gone. This compares runs actually recorded against the
+ * theoretical maximum for the time elapsed, which turns "the bot felt like it
+ * stopped for a while" into a number.
+ *
+ * The ceiling is theoretical — sleep, the ~6s a mission takes to resolve and the
+ * 1s internal cooldown all eat into it, so high nineties is a practical maximum.
+ */
+const utilisation = async (userId, cooldowns, sinceMs = null) => {
+  let since = sinceMs ? new Date(Date.now() - sinceMs) : lastDailyReset();
+
+  // Never measure against time we weren't recording. Tracking started recently,
+  // so asking for "last 7 days" would otherwise count the days before the bot
+  // existed as thousands of missed runs — a number that looks alarming and means
+  // nothing. Clamp the window to the history we actually have.
+  const first = await XpEvent.findOne({ userId }).sort({ at: 1 }).lean();
+  let truncated = false;
+  if (first && new Date(first.at) > since) {
+    since = new Date(first.at);
+    truncated = Boolean(sinceMs);
+  }
+
+  const hours = (Date.now() - since.getTime()) / 3_600_000;
+  if (hours <= 0.1) return null;
+
+  const rows = await XpEvent.find({ userId, at: { $gte: since } }).lean();
+  const counts = {};
+  for (const r of rows) counts[r.source] = (counts[r.source] ?? 0) + 1;
+
+  const out = [];
+  for (const [command, seconds] of Object.entries(cooldowns)) {
+    if (!seconds || seconds > 6 * 3600) continue;      // only fast, repeatable ones
+    if (counts[command] == null) continue;             // never seen — not being played
+    const possible = Math.floor((hours * 3600) / seconds);
+    if (possible < 1) continue;
+    const done = counts[command];
+    out.push({ command, done, possible, pct: Math.min(100, (done / possible) * 100) });
+  }
+  out.sort((a, b) => a.pct - b.pct);                   // worst first — that's the news
+  return { hours, rows: out, truncated };
+};
+
+const utilisationReport = async (userId, cooldowns, sinceMs, label) => {
+  const u = await utilisation(userId, cooldowns, sinceMs);
+  if (!u || !u.rows.length) {
+    return `<@${userId}> nothing recorded yet for ${label} — play a little and check back.`;
+  }
+
+  const lines = [
+    `<@${userId}> 📊 **utilisation** — ${label} (${u.hours.toFixed(1)}h)` +
+      (u.truncated ? ` -# only ${u.hours.toFixed(1)}h of history exists` : ''),
+    `-# how many runs you took vs how many the cooldowns allowed`,
+    '',
+  ];
+
+  let lostValue = 0;
+  for (const r of u.rows) {
+    const filled = Math.round(r.pct / 10);
+    const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+    const missed = Math.max(0, r.possible - r.done);
+    if (r.command === 'mission') lostValue += missed * 231;   // ~avg ryo per mission
+    const flag = r.pct >= 90 ? '' : r.pct >= 70 ? ' ⚠️' : ' ❗';
+    lines.push(
+      `\`${bar}\` **${r.pct.toFixed(0)}%** ${r.command} — ${fmt(r.done)}/${fmt(r.possible)}` +
+      (missed ? ` -# ${fmt(missed)} missed` : '') + flag
+    );
+  }
+
+  if (lostValue > 0) {
+    lines.push('', `-# roughly **${fmt(lostValue)} ryo** left on the table from missed missions`);
+  }
+  lines.push(`-# 100% is theoretical — sleep and command time make ~95% the real ceiling`);
+  return lines.join('\n');
+};
+
 /** Record a gain the page-based `observe` doesn't cover (e.g. daily tier rewards). */
 const recordExternal = (userId, source, amount, ryo, key) =>
   saveEvent(userId, source, amount, ryo, key);
 
 module.exports = {
   observe, report, lastDailyReset, normaliseName, recordExternal, missionReport,
+  utilisation, utilisationReport,
 };

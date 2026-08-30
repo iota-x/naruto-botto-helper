@@ -3,6 +3,15 @@ const { Client, GatewayIntentBits, Collection } = require('discord.js');
 const mongoose = require('mongoose');
 require('dotenv').config();
 
+// ─── Timestamped logs ─────────────────────────────────────────────────────────
+// Every log line goes through console.*, and none of them carried a time. When a
+// reminder failed to fire there was no way to line the log up against Discord, so
+// stamp them all at the source rather than editing every call site.
+for (const level of ['log', 'warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => original(`[${new Date().toISOString()}]`, ...args);
+}
+
 const { handleBalanceReaction } = require('./events/helpers');
 
 // ─── Discord client ───────────────────────────────────────────────────────────

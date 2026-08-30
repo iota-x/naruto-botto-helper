@@ -23,7 +23,7 @@ const FILE      = process.env.DEBUG_CAPTURE_FILE || null;
 
 const TRACE = process.env.DEBUG_TRACE === '1' || ENABLED;
 
-const NARUTO_BOT_ID = '770100332998295572';
+const { GAME_BOT_ID: NARUTO_BOT_ID } = require('./config');
 
 // Discord component types, so dumps read as names rather than numbers.
 const COMPONENT_TYPES = {

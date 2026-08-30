@@ -1,6 +1,6 @@
 const main = require('./main');
 
-const NARUTO_BOT_ID = '770100332998295572';
+const { GAME_BOT_ID: NARUTO_BOT_ID } = require('../config');
 
 // The game bot edits its pages in place rather than sending a follow-up:
 //   "report info" → "report writing" → "report result"  (carries the XP gained)
