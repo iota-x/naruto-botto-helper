@@ -9,6 +9,8 @@ few things the game makes you remember yourself.
 Nothing is automated on your behalf — it only reads pages the game already sent you and
 tells you what they say.
 
+**[➕ Add the bot to your server](https://discord.com/oauth2/authorize?client_id=972546929194061956)**
+
 ---
 
 ## Why it works the way it does
@@ -121,6 +123,9 @@ Gated on `OWNER_ID` and fails closed — with nothing configured, nobody is auth
 ---
 
 ## Setup
+
+Most people want the [hosted bot](https://discord.com/oauth2/authorize?client_id=972546929194061956)
+— invite it and you are done. To run your own copy:
 
 ```bash
 git clone https://github.com/iota-x/naruto-botto-helper.git
