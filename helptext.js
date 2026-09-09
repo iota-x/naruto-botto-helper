@@ -2,10 +2,6 @@
 // Single source of truth for what the bot does. Kept apart from the command so
 // the text is easy to keep in step with the code as features land.
 
-// Configured via OWNER_ID in .env; kept out of the source so a public copy of
-// this repo carries nobody's Discord id.
-const OWNER_ID = process.env.OWNER_ID || null;
-
 // Cooldowns the bot arms, in the order they matter day to day.
 const COOLDOWNS = [
   ['mission',  '`n m`',            '1m'],
@@ -504,7 +500,10 @@ const TOPICS = {
 
   admin: {
     title: '🗄️ Admin',
-    description: `Owner only${OWNER_ID ? ` (<@${OWNER_ID}>)` : ''}. Everything here touches the database directly.`,
+    // Deliberately does not name or mention the owner: printing `<@OWNER_ID>`
+    // put the id back in front of everyone who ran `nh help db` — and pinged
+    // them — which is exactly what moving it into .env was meant to stop.
+    description: 'Owner only. Everything here touches the database directly.',
     fields: [
       {
         name: 'Inspect',

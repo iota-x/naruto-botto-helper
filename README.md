@@ -1,5 +1,7 @@
 # Naruto Botto Helper
 
+*A bot made by @eiota on Discord.*
+
 A Discord companion bot for [Naruto Botto](https://discord.gg/fC6aFSHWF2). It watches the
 game bot's own messages and turns them into cooldown reminders, progress tracking, and a
 few things the game makes you remember yourself.
@@ -190,6 +192,13 @@ digest.js           daily digest and streaks
 helptext.js         all in-Discord help content
 debug.js            capture and decision tracing
 ```
+
+## Credits
+
+Made by **@eiota** on Discord.
+
+Not affiliated with Naruto Botto — this is a companion bot that reads the pages the
+game already sent you.
 
 ## Licence
 

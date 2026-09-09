@@ -1,5 +1,5 @@
 {
-  "name": "naruto-helper",
+  "name": "naruto-botto-helper",
   "version": "1.0.0",
   "main": "index.js",
   "engines": {
@@ -12,8 +12,13 @@
     "type": "git",
     "url": "git+https://github.com/iota-x/naruto-botto-helper.git"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "discord",
+    "discord-bot",
+    "naruto-botto",
+    "reminders"
+  ],
+  "author": "eiota",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/iota-x/naruto-botto-helper/issues"
@@ -29,5 +34,5 @@
     "ms": "^2.1.3",
     "node-cache": "^5.1.2"
   },
-  "description": ""
+  "description": "Discord companion bot for Naruto Botto \u2014 cooldown reminders armed by the game's own confirmations, plus XP, feed, dailies and economy tracking."
 }
